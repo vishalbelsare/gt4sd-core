@@ -25,14 +25,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Hashable
 import logging
 import os
 import shutil
-import signal
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
+from time import time
 from typing import (
     Any,
     Callable,
@@ -54,8 +55,9 @@ from ..configuration import (
     get_algorithm_subdirectories_with_s3,
     get_cached_algorithm_path,
     sync_algorithm_with_s3,
+    upload_to_s3,
 )
-from ..exceptions import InvalidItem, S3SyncError, SamplingError
+from ..exceptions import GT4SDTimeoutError, InvalidItem, S3SyncError, SamplingError
 from ..training_pipelines.core import TrainingPipelineArguments
 
 logger = logging.getLogger(__name__)
@@ -72,6 +74,8 @@ U = TypeVar("U")  # used for additional context (e.g. part of target definition)
 Targeted = Callable[[T], Iterable[Any]]
 # callable not taking any target
 Untargeted = Callable[[], Iterable[Any]]
+# predictive model
+Predictor = Callable[[Any], Any]
 
 
 class GeneratorAlgorithm(ABC, Generic[S, T]):
@@ -137,6 +141,27 @@ class GeneratorAlgorithm(ABC, Generic[S, T]):
             If the target is None, the generator is assumed to be untargeted.
         """
 
+    def timeout(self, item_set: Set, detail: str, error: TimeoutError) -> None:
+        """Throws a timeout exception if applicable, otherwise returns
+            items gracefully.
+
+        Args:
+            item_set: Set of items generated thus far.
+            detail: context or condition for the generation.
+            error: An error instance, child class of `TimeoutError` either
+                `GT4SDTimeoutError` or `SamplingError`.
+
+        Raises:
+            TimeoutError: If no items were sampled so far.
+        """
+        if len(item_set) == 0:
+            logger.error(detail + "Exiting now!")
+            raise error(title="No samples generated", detail=detail)  # type: ignore
+        logger.warning(
+            detail
+            + f"Returning {len(item_set)} instead of {self.number_of_items} items!"
+        )
+
     def _setup_untargeted_generator(
         self,
         configuration: AlgorithmConfiguration[S, T],
@@ -161,11 +186,6 @@ class GeneratorAlgorithm(ABC, Generic[S, T]):
         else:
             return partial(self.generator, self.target)  # type: ignore
 
-    def timeout(self, signum, frame):
-        raise TimeoutError(
-            "Alarm signal received, probably because a signal.alarm timed out.",
-        )
-
     def sample(self, number_of_items: int = 100) -> Iterator[S]:
         """Generate a number of unique and valid items.
 
@@ -181,84 +201,72 @@ class GeneratorAlgorithm(ABC, Generic[S, T]):
                 Defaults to 100.
 
         Raises:
-            SamplingError: when requesting too many items or when no items were yielded.
-                The later happens in case of not generating samples in a number of calls
-                and when taking longer than the allowed time limit.
+            SamplingError: when requesting too many items.
+            GT4SDTimeoutError: when the algorithm takes longer than the allowed time limit.
+                Or when no items were yielded (i.e., if not generating samples for many
+                consecutive calls).
 
         Yields:
             the items.
         """
+        self.number_of_items = number_of_items
 
         if number_of_items > self.max_samples:
             detail = (
                 f"{number_of_items} is too many items to generate, "
                 f"must be under {self.max_samples+1} samples."
             )
-            logger.warning(detail)
-            raise SamplingError(title="Exceeding max_samples", detail=detail)
+            self.timeout(set(), detail=detail, error=SamplingError)  # type: ignore
 
-        def raise_if_none_sampled(items: set, detail: str):
-            """If exiting early there should be at least one generated item.
-
-            Args:
-                items: to check if it's empty.
-                detail: error message in case the exception is raised.
-
-            Raises:
-                SamplingError: using the given detail.
-            """
-            if len(items) == 0:
-                raise SamplingError(
-                    title="No samples generated",
-                    detail="No samples generated." + detail,
-                )
-
-        item_set = set()
+        item_set: Set = set()
         stuck_counter = 0
         item_set_length = 0
-        signal.signal(signal.SIGALRM, self.timeout)
-        signal.alarm(self.max_runtime)
-        try:
-            while True:
-                generated_items = self.generate()  # type:ignore
-                for item in generated_items:
-                    if item in item_set:
-                        continue
+        start = time()
+        while True:
+            if time() - start > self.max_runtime:
+                detail = f"Sampling took longer than maximal runtime ({self.max_runtime} seconds). "
+                self.timeout(item_set, detail=detail, error=GT4SDTimeoutError)  # type: ignore
+                return
+
+            generated_items = self.generate()  # type:ignore
+            for index, item in enumerate(generated_items):
+                try:
+                    valid_item = self.configuration.validate_item(item)
+                    # check if sample is hashable
+                    if not isinstance(item, Hashable):
+                        yield valid_item
+                        item_set.add(str(index))
                     else:
-                        try:
-                            valid_item = self.configuration.validate_item(item)
-                            yield valid_item
-                            item_set.add(item)
-                            if len(item_set) == number_of_items:
-                                signal.alarm(0)
-                                return
-                        except InvalidItem as error:
-                            logger.debug(
-                                f"item {item} could not be validated, "
-                                f"raising {error.title}: {error.detail}"
-                            )
+                        # validation for samples represented as strings
+                        if item in item_set:
                             continue
-                # make sure we don't keep sampling more than a given number of times,
-                # in case no new items are generated.
-                if len(item_set) == item_set_length:
-                    stuck_counter += 1
-                else:
-                    stuck_counter = 0
-                if (
-                    stuck_counter
-                    >= gt4sd_configuration_instance.gt4sd_max_number_of_stuck_calls
-                ):
-                    detail = f"no novel samples generared for more than {gt4sd_configuration_instance.gt4sd_max_number_of_stuck_calls} cycles"
-                    logger.warning(detail + ", exiting")
-                    signal.alarm(0)
-                    raise_if_none_sampled(items=item_set, detail=detail)
-                    return
-                item_set_length = len(item_set)
-        except TimeoutError:
-            detail = f"Samples took longer than {self.max_runtime} seconds to generate"
-            logger.warning(detail + ", exiting")
-            raise_if_none_sampled(items=item_set, detail=detail)
-        signal.alarm(0)
+                        else:
+                            yield valid_item
+                            item_set.add(item)  # type:ignore
+                    if len(item_set) == number_of_items:
+                        return
+                except InvalidItem as error:
+                    logger.debug(
+                        f"item {item} could not be validated, "
+                        f"raising {error.title}: {error.detail}"
+                    )
+                    continue
+
+            # make sure we don't keep sampling more than a given number of times,
+            # in case no new items are generated.
+            if len(item_set) == item_set_length:
+                stuck_counter += 1
+            else:
+                stuck_counter = 0
+            if (
+                stuck_counter
+                >= gt4sd_configuration_instance.gt4sd_max_number_of_stuck_calls
+            ):
+                prefix = "No" if len(item_set) == 0 else "No new"
+                detail = f"{prefix} samples generated for more than {gt4sd_configuration_instance.gt4sd_max_number_of_stuck_calls} cycles. "
+                self.timeout(item_set, detail=detail, error=GT4SDTimeoutError)  # type: ignore
+                return
+            item_set_length = len(item_set)
 
     def validate_configuration(
         self, configuration: AlgorithmConfiguration
@@ -276,6 +284,85 @@ class GeneratorAlgorithm(ABC, Generic[S, T]):
         """
         logger.info("no parameters validation")
         return configuration
+
+
+class PredictorAlgorithm(ABC, Generic[S, T]):
+    """Interface for automated prediction via an :class:`AlgorithmConfiguration`."""
+
+    #: The maximum amount of time we should let the algorithm run
+    max_runtime: int = gt4sd_configuration_instance.gt4sd_max_runtime
+
+    def __init__(self, configuration: AlgorithmConfiguration[S, T]):
+        """Targeted or untargeted generation.
+
+        Args:
+            configuration: application specific helper that allows to setup the
+                generator.
+        """
+        logger.info(
+            f"runnning {self.__class__.__name__} with configuration={configuration}"
+        )
+        self.configuration = configuration
+        self.predictor = self.get_predictor(configuration)
+
+    def get_predictor(
+        self,
+        configuration: AlgorithmConfiguration[S, T],
+    ) -> Predictor:
+        """Set up the predictive model from the configuration. This is called at
+            instantiation of the PredictorAlgorithm and must return a callable.
+
+        Returns:
+            predictor, a callable that takes an item and returns a prediction.
+        """
+        logger.info("ensure artifacts for the application are present.")
+        self.local_artifacts = configuration.ensure_artifacts()
+        model: Predictor = self.get_model(self.local_artifacts)
+        return model
+
+    @abstractmethod
+    def get_model(self, resources_path: str) -> Predictor:
+        """
+        Restore the model from a local path.
+
+        Note:
+            This is the major method to implement in child classes, it is called
+            at instantiation of the PredictorAlgorithm and must return a callable:
+
+        Args:
+            resources_path: local path to the downloaded artifacts.
+
+        Returns:
+            Predictor (callable)
+        """
+        raise NotImplementedError("Not implemented in baseclass.")
+
+    def predict(self, input: Any) -> Any:
+        """Perform a prediction for an input.
+        Args:
+            input: the input for the predictive model
+
+        Raises:
+            TimeoutError: when the walltime limit is hit.
+
+        Returns:
+            the prediction.
+        """
+
+        try:
+            predicted = self.predictor(input)
+        except TimeoutError:
+            detail = (
+                f"Predicting took longer than maximum ({self.max_runtime} seconds)."
+            )
+            logger.warning(detail + " Exiting now!")
+        except Exception:
+            raise Exception(f"{self.__class__.__name__} failed with {input}")
+        return predicted
+
+    def __call__(self, input: Any) -> Any:
+        """Alias for `self.predict`."""
+        return self.predict(input)
 
 
 @dataclass
@@ -443,6 +530,33 @@ class AlgorithmConfiguration(Generic[S, T]):
         return versions
 
     @classmethod
+    def list_remote_versions(cls, prefix) -> Set[str]:
+        """Get possible algorithm versions on s3.
+           Before uploading an artifact on S3, we need to check that
+           a particular version is not already present and overwrite by mistake.
+           If the final set is empty we can then upload the folder artifact.
+           If the final set is not empty, we need to check that the specific version
+           of interest is not present.
+
+        only S3 is searched (not the local cache) for matching versions.
+
+        Returns:
+            viable values as :attr:`algorithm_version` for the environment.
+        """
+        # all name without version
+        if not prefix:
+            prefix = cls.get_application_prefix()
+        try:
+            versions = get_algorithm_subdirectories_with_s3(prefix)
+        except (KeyError, S3SyncError) as error:
+            logger.info(
+                f"searching S3 raised {error.__class__.__name__}. This means that no versions are available on S3."
+            )
+            logger.debug(error)
+            versions = set()
+        return versions
+
+    @classmethod
     def get_filepath_mappings_for_training_pipeline_arguments(
         cls, training_pipeline_arguments: TrainingPipelineArguments
     ) -> Dict[str, str]:
@@ -509,9 +623,11 @@ class AlgorithmConfiguration(Generic[S, T]):
                 target_version,
             )
             filepaths_mapping = {
-                filename: source_filepath
-                if os.path.exists(source_filepath)
-                else os.path.join(source_missing_path, filename)
+                filename: (
+                    source_filepath
+                    if os.path.exists(source_filepath)
+                    else os.path.join(source_missing_path, filename)
+                )
                 for filename, source_filepath in filepaths_mapping.items()
             }
             logger.info(f"Saving artifacts into {target_path}...")
@@ -534,6 +650,101 @@ class AlgorithmConfiguration(Generic[S, T]):
             )
 
             logger.info(f"Artifacts saving completed into {target_path}")
+
+    @classmethod
+    def upload_version_from_training_pipeline_arguments_postprocess(
+        cls,
+        training_pipeline_arguments: TrainingPipelineArguments,
+    ):
+        """Postprocess after uploading. Not implemented yet.
+
+        Args:
+            training_pipeline_arguments: training pipeline arguments.
+        """
+        pass
+
+    @classmethod
+    def upload_version_from_training_pipeline_arguments(
+        cls,
+        training_pipeline_arguments: TrainingPipelineArguments,
+        target_version: str,
+        source_version: Optional[str] = None,
+    ) -> None:
+        """Upload a version using training pipeline arguments.
+
+        Args:
+            training_pipeline_arguments: training pipeline arguments.
+            target_version: target version used to save the model in s3.
+            source_version: source version to use for missing artifacts.
+                Defaults to None, a.k.a., use the default version.
+        """
+        filepaths_mapping: Dict[str, str] = {}
+
+        try:
+            filepaths_mapping = (
+                cls.get_filepath_mappings_for_training_pipeline_arguments(
+                    training_pipeline_arguments=training_pipeline_arguments
+                )
+            )
+        except ValueError:
+            logger.info(
+                f"{cls.__name__} can not save a version based on {training_pipeline_arguments}"
+            )
+
+        if len(filepaths_mapping) > 0:
+            # probably redundant
+            if source_version is None:
+                source_version = cls.algorithm_version
+            source_missing_path = cls.ensure_artifacts_for_version(source_version)
+
+            # prefix for a run
+            prefix = cls.get_application_prefix()
+            # versions in s3 with that prefix
+            versions = cls.list_remote_versions(prefix)
+
+            # check if the target version is already in s3. If yes, don't upload.
+            if target_version not in versions:
+                logger.info(
+                    f"There is no version {target_version} in S3, starting upload..."
+                )
+            else:
+                logger.info(
+                    f"Version {target_version} already exists in S3, skipping upload..."
+                )
+                return
+
+            # mapping between filenames and paths for a version.
+            filepaths_mapping = {
+                filename: (
+                    source_filepath
+                    if os.path.exists(source_filepath)
+                    else os.path.join(source_missing_path, filename)
+                )
+                for filename, source_filepath in filepaths_mapping.items()
+            }
+
+            logger.info(
+                f"Uploading artifacts into {os.path.join(prefix, target_version)}..."
+            )
+            try:
+                for target_filename, source_filepath in filepaths_mapping.items():
+                    # algorithm_type/algorithm_name/algorithm_application/version/filename
+                    # for the moment we assume that the prefix exists in s3.
+                    target_filepath = os.path.join(
+                        prefix, target_version, target_filename
+                    )
+                    upload_to_s3(target_filepath, source_filepath)
+                    logger.info(
+                        f"Upload artifact {source_filepath} into {target_filepath}..."
+                    )
+
+            except S3SyncError:
+                logger.warning("Problem with upload...")
+                return
+
+            logger.info(
+                f"Artifacts uploading completed into {os.path.join(prefix, target_version)}"
+            )
 
     @classmethod
     def ensure_artifacts_for_version(cls, algorithm_version: str) -> str:
@@ -579,6 +790,108 @@ class AlgorithmConfiguration(Generic[S, T]):
         return self.ensure_artifacts_for_version(self.algorithm_version)
 
 
+class ConfigurablePropertyAlgorithmConfiguration(AlgorithmConfiguration):
+    """A configurable AlgorithmConfiguration to be used by the properties submodule."""
+
+    module: str = "properties"
+
+    def __init__(
+        self,
+        domain: str,
+        algorithm_name: str,
+        algorithm_application: str,
+        algorithm_version: str = "v0",
+        algorithm_type: str = "prediction",
+    ):
+        """
+        Args:
+            domain: submodule of properties where the model resides.
+            algorithm_version: name of the predictive model, e.g., `MCA`.
+            algorithm_application: application of the algorithm, e.g., dataset it was
+                trained on, like `Tox21`.
+            algorithm_version: version of the algorithm, defaults to `v0`.
+            algorithm_type: type of the algorithm. This should be `prediction`.
+        """
+        self.algorithm_type = algorithm_type  # type: ignore
+        self.domain = domain  # type: ignore
+        self.algorithm_name = algorithm_name  # type: ignore
+        self.algorithm_application = algorithm_application  # type: ignore
+        self.algorithm_version = algorithm_version
+
+    def get_application_prefix(self) -> str:  # type: ignore
+        """Get prefix up to the specific application.
+
+        NOTE: Unlike the parent method this uses the assgined attributes since it's
+        configurable.
+
+        Returns:
+            the application prefix.
+        """
+        return os.path.join(
+            self.domain, self.algorithm_name, self.algorithm_application
+        )
+
+    def ensure_artifacts_for_version(self, algorithm_version: str) -> str:  # type: ignore
+        """The artifacts matching the path defined by class attributes and the given version are downloaded.
+
+        NOTE: Unlike the parent method this uses the assigned attributes since it's
+        configurable.
+
+        That is all objects under ``algorithm_type/algorithm_name/algorithm_application/algorithm_version``
+        in the bucket are downloaded.
+
+        Args:
+            algorithm_version: version of the algorithm to ensure artifacts for.
+
+        Returns:
+            the common local path of the matching artifacts.
+        """
+        prefix = os.path.join(
+            self.get_application_prefix(),
+            algorithm_version,
+        )
+        try:
+            local_path = sync_algorithm_with_s3(prefix, module=self.module)
+        except (KeyError, S3SyncError) as error:
+            logger.info(
+                f"searching S3 raised {error.__class__.__name__}, using local cache only."
+            )
+            logger.debug(error)
+            local_path = get_cached_algorithm_path(prefix, module=self.module)
+            if not os.path.isdir(local_path):
+                raise OSError(
+                    f"artifacts directory {local_path} does not exist locally, and syncing with s3 failed: {error}"
+                )
+
+        return local_path
+
+    def list_versions(self) -> Set[str]:  # type: ignore
+        """Get possible algorithm versions.
+
+        NOTE: Unlike the parent method this uses the assigned attributes since it's
+        configurable.
+
+        S3 is searched as well as the local cache is searched for matching versions.
+
+        Returns:
+            viable values as :attr:`algorithm_version` for the environment.
+        """
+
+        prefix = self.get_application_prefix()
+        try:
+            versions = get_algorithm_subdirectories_with_s3(prefix, module=self.module)
+        except (KeyError, S3SyncError) as error:
+            logger.info(
+                f"searching S3 raised {error.__class__.__name__}, using local cache only."
+            )
+            logger.debug(error)
+            versions = set()
+        versions = versions.union(
+            get_algorithm_subdirectories_in_cache(prefix, module=self.module)
+        )
+        return versions
+
+
 def get_configuration_class_with_attributes(
     klass: Type[AlgorithmConfiguration],
 ) -> Type[AlgorithmConfiguration]:
@@ -599,8 +912,6 @@ def get_configuration_class_with_attributes(
 
 
 class PropertyPredictor(ABC, Generic[S, U]):
-    """WIP"""
-
     def __init__(self, context: U) -> None:
         """Property predictor to investigate items.
 
@@ -608,6 +919,7 @@ class PropertyPredictor(ABC, Generic[S, U]):
             context: the context in which a property of an item can be
                 computed or checked is very application specific.
         """
+        logger.warning("This class will be deprecated in a future release.")
         self.context = context
         # or pass these with methods?
 

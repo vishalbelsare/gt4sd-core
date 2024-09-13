@@ -25,7 +25,7 @@ import logging
 from dataclasses import field
 from typing import Any, Callable, ClassVar, Dict, Iterable, Optional, TypeVar
 
-from ....domains.materials import SmallMolecule, validate_molecules
+from ....domains.materials import SMILES, MoleculeFormat, validate_molecules
 from ....exceptions import InvalidItem
 from ...core import AlgorithmConfiguration, GeneratorAlgorithm
 from ...registry import ApplicationsRegistry
@@ -116,6 +116,10 @@ class ReinventGenerator(AlgorithmConfiguration[str, str]):
         default=True,
         metadata=dict(description=("Generate unique sample sequences if set to true")),
     )
+    max_sequence_length: int = field(
+        default=256,
+        metadata=dict(description=("Maximal length of SMILES sequences")),
+    )
 
     def get_target_description(self) -> Dict[str, str]:
         """Get description of the target for generation.
@@ -145,9 +149,10 @@ class ReinventGenerator(AlgorithmConfiguration[str, str]):
             batch_size=self.batch_size,
             randomize=self.randomize,
             sample_uniquely=self.sample_uniquely,
+            max_sequence_length=self.max_sequence_length,
         )
 
-    def validate_item(self, item: str) -> SmallMolecule:
+    def validate_item(self, item: str) -> SMILES:
         """Check that item is a valid SMILES.
 
         Args:
@@ -159,11 +164,13 @@ class ReinventGenerator(AlgorithmConfiguration[str, str]):
         Returns:
             the validated SMILES.
         """
-        molecules, _ = validate_molecules(smiles_list=[item])
+        molecules, _ = validate_molecules(
+            pattern_list=[item], input_type=MoleculeFormat.smiles
+        )
 
         if molecules[0] is None:
             raise InvalidItem(
                 title="InvalidSMILES",
                 detail=f'rdkit.Chem.MolFromSmiles returned None for "{item}"',
             )
-        return SmallMolecule(item)
+        return SMILES(item)

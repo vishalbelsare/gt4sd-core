@@ -1,7 +1,7 @@
 #
 # MIT License
 #
-# Copyright (c) 2022 GT4SD team
+# Copyright (c) 2023 GT4SD team
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -25,18 +25,25 @@
 import json
 import logging
 import os
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
+import numpy as np
 import torch
+from rdkit import Chem
 from terminator.collators import MaskedTextCollator, PropertyCollator
 from terminator.inference import InferenceRT
 from terminator.search import SEARCH_FACTORY, Search
-from terminator.selfies import decoder
-from terminator.tokenization import InferenceBertTokenizer
+from terminator.selfies import decoder, encoder
+from terminator.tokenization import (
+    InferenceBertTokenizer,
+    PolymerGraphTokenizer,
+    SelfiesTokenizer,
+)
 from transformers import AutoConfig, AutoModelWithLMHead, XLNetLMHeadModel
 
-from ....domains.materials import Property, Sequence, validate_molecules
-from ....frameworks.torch import device_claim
+from ....domains.materials import MoleculeFormat, Sequence, validate_molecules
+from ....frameworks.torch import device_claim, map_tensor_dict
+from .utils import filter_stubbed, get_substructure_indices
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -48,42 +55,49 @@ class ConditionalGenerator:
     # device where the inference is running.
     device: torch.device
 
-    # The task the RT is currently performing. Either 'regression' or 'generation'
+    # The task the RT is currently performing. Either 'regression' or 'generation'.
     task: str
 
-    # method to convert logits to predictions. Either GreedySearch or SamplingSearch
+    # method to convert logits to predictions. Either GreedySearch or SamplingSearch.
     search: Search
 
     # ***** Additional attributes for text generation *****
-    # data collator for property prediction of self-generated items
+    # data collator for property prediction of self-generated items.
     property_collator: PropertyCollator
 
-    # percentage of tolerated deviation between desired and obtained property
-    tolerance: float = 20
+    # The input format for the substructures
+    subs_format: str
 
-    # number of samples obtained per call
+    # number of samples obtained per call.
     batch_size: int = 8
 
+    # a dictionary to specify sampling from a specific seed molecule.
+    sampling_wrapper: Dict[str, Any] = {}
+
     def __init__(
-        self, resources_path: str, device: Optional[Union[torch.device, str]] = None
+        self,
+        resources_path: str,
+        device: Optional[Union[torch.device, str]] = None,
+        tolerance: Union[float, Dict[str, float]] = 20.0,
     ) -> None:
         """
         Initialize the generator.
 
         Args:
             resources_path: directory where to find models and parameters.
-            temperature: temperature for the sampling. Defaults to 1.4.
-            generated_length: maximum length of the generated molecules.
-                Defaults to 100.
-            samples_per_protein: number of points sampled per protein.
-                It has to be greater than 1. Defaults to 10.
             device: device where the inference is running either as a dedicated class
                 or a string. If not provided is inferred.
+            tolerance:  percentage of tolerated deviation between desired and obtained property.
+                Either a single float or a dictionary of floats, where the keys are the properties.
+                Note that the tolerance is *only* used for post-hoc filtering of the generated molecules.
         """
         # device
         self.device = device_claim(device)
-
         # Set up the data preparation pipeline
+        if not os.path.exists(os.path.join(resources_path, "inference.json")):
+            raise OSError(
+                f"algorithm_version {resources_path.split('/')[-1]} does not exist."
+            )
         self.tokenizer = InferenceBertTokenizer.from_pretrained(
             resources_path, pad_even=False
         )
@@ -95,6 +109,7 @@ class ConditionalGenerator:
         self.model = InferenceRT(xlnet_model, self.tokenizer, config)
 
         # Set up inference parameters
+        self.tolerance = tolerance
         self.load_inference(resources_path)
 
     def load_model(self, resources_path: str) -> Tuple[XLNetLMHeadModel, Any]:
@@ -129,43 +144,155 @@ class ConditionalGenerator:
         try:
             with open(os.path.join(resources_path, "inference.json"), "r") as f:
                 data = json.load(f)
-            self.property = data["property_token"]
-            self.property_mask_length = data["property_mask_length"][self.property]
-            self.min_ = data.get("property_ranges", {}).get(self.property, [0, 1])[0]
-            self.max_ = data.get("property_ranges", {}).get(self.property, [0, 1])[1]
+            self.properties = data["property_token"]
+            if isinstance(self.properties, str):
+                self.properties = [self.properties]
+
+            # Optional normalize parameter (for property) defaults to True
+            self.do_normalize = data.get("normalize", [True] * len(self.properties))
+
+            self.property_mask_lengths = [
+                data["property_mask_length"][p] for p in self.properties
+            ]
+            self._mins = [
+                data.get("property_ranges", {}).get(p, [0, 1])[0]
+                for p in self.properties
+            ]
+            self._maxs = [
+                data.get("property_ranges", {}).get(p, [0, 1])[1]
+                for p in self.properties
+            ]
+            # In case custom normalization/denormalization is required
+            self.normalization_fns = [
+                data.get("normalization_fns", {}).get(p, None) for p in self.properties
+            ]
+            self.denormalization_fns = [
+                data.get("denormalization_fns", {}).get(p, None)
+                for p in self.properties
+            ]
             self.metadata = data
+
+            # If tolerance dict is given, ensure it is well-formed
+            self.tolerance_dict = {}
+            if isinstance(self.tolerance, Dict):
+                # Check that no extra properties are given
+                for key in self.tolerance.keys():
+                    if key not in self.properties:
+                        logger.error(
+                            f"tolerance key {key} is not a valid property name, will be ignored."
+                        )
+                # Check that all properties are given
+                for key in self.properties:
+                    if key not in self.tolerance.keys():
+                        logger.error(
+                            f"tolerance key {key} is missing, will be set to 20%."
+                        )
+                    self.tolerance_dict[key] = self.tolerance.get(key, 20.0)
+
+            elif isinstance(self.tolerance, float):
+                for key in self.properties:
+                    self.tolerance_dict[key] = self.tolerance
+            else:
+                raise TypeError(
+                    f"tolerance must be either a float or a dictionary, not {type(self.tolerance)}."
+                )
+
+            # Tolerance defined on the original scale
+            self.tolerances = [
+                (self._maxs[i] - self._mins[i]) * self.tolerance_dict[k] / 100.0
+                for i, k in enumerate(self.properties)
+            ]
         except Exception:
             raise ValueError(
                 f"Could not restore inference parameters from {resources_path}"
             )
 
-    def denormalize(self, x: float, precision: int = 4) -> float:
+    def denormalize(self, x: float, idx: int, precision: int = 4) -> float:
         """
-        Denormalize from [0,1] scale to original scale.
+        Denormalize from the model scale to the original scale.
 
         Args:
-            x: normalized value.
+            x: normalized value (often in [0,1]).
+            idx: index of the property.
             precision: optional rounding precision. Defaults to 4.
 
         Returns:
             float: Value in regular scale.
         """
-        return round(x * (self.max_ - self.min_) + self.min_, precision)
+        # If the property was not normalized, return the value
+        if not self.do_normalize[idx]:
+            return x
 
-    def normalize(self, x: float, precision: int = 3) -> float:
+        # The default normalization reverts a linear transformation to [0,1] scale
+        if self.denormalization_fns[idx] is None:
+            return round(
+                x * (self._maxs[idx] - self._mins[idx]) + self._mins[idx], precision
+            )
+
+        # This allows to revert arbitrarily complex preprocessing functions
+        fn = self.denormalization_fns[idx]
+        try:
+            denormed = eval(fn)(x)
+            return round(denormed, precision)
+        except SyntaxError:
+            raise SyntaxError(
+                f"Custom denormalization function {fn} seems improperly formatted"
+            )
+
+    def normalize(self, x: str, idx: int, precision: int = 3) -> float:
         """
-        Normalize from original scale to [0,1] scale.
+        Normalize from original scale to desired scale.
 
         Args:
             x: unnormalized input.
+            idx: index of the property.
             precision: optional rounding precision.
 
         Returns:
             float: Normalized value.
         """
-        return round((x - self.min_) / (self.max_ - self.min_), precision)
+        # Error handling
+        if not isinstance(x, float) and not self.isfloat(x):
+            raise TypeError(f"{x} is not a float and cant safely be casted.")
+
+        x_float = float(x)
+        if x_float < self._mins[idx] or x_float > self._maxs[idx]:
+            raise ValueError(
+                f"Property value {x_float} for {self.properties[idx]} is outside of "
+                f"model's range [{self._mins[idx]}, {self._maxs[idx]}]."
+            )
+        # If this property does not require normalization, return it
+        if not self.do_normalize[idx]:
+            return x_float
+
+        # This performs a standard linear normalization to [0,1]
+        if self.normalization_fns[idx] is None:
+            normed = round(
+                (x_float - self._mins[idx]) / (self._maxs[idx] - self._mins[idx]),
+                precision,
+            )
+            return normed
+
+        # Allows to apply arbitrary preprocessing functions
+        fn = self.normalization_fns[idx]
+        try:
+            normed = eval(fn)(x_float)
+            return round(normed, precision)
+        except SyntaxError:
+            raise SyntaxError(
+                f"Custom normalization function {fn} seems improperly formatted"
+            )
 
     def validate_input(self, x: str) -> None:
+        """
+        Sanity checking for formatting of the input string.
+
+        Args:
+            x: The string to be validated.
+
+        Raises:
+            ValueError: If string was formatted incorrectly.
+        """
 
         if self.tokenizer.expression_separator not in x:
             raise ValueError(
@@ -174,14 +301,17 @@ class ConditionalGenerator:
             )
         if self.tokenizer.mask_token not in x:
             raise ValueError(
-                f"Nothing to do, no mask to fill ({self.tokenizer.mask_token}) found"
+                f"Nothing to do, no mask to fill ({self.tokenizer.mask_token}) found "
                 f"in input {x}."
             )
-        if self.property not in x:
-            raise ValueError(f"No property token ({self.property}) found in input")
+        if not all(p in x for p in self.properties):
+            raise ValueError(
+                f"Not all property tokens ({self.properties}) found in input"
+            )
 
         text_sequence = x.split(self.tokenizer.expression_separator)[-1]
         number_sequence = x[: -len(text_sequence) - 1]
+
         if (
             self.tokenizer.mask_token in text_sequence
             and self.tokenizer.mask_token in number_sequence
@@ -189,9 +319,18 @@ class ConditionalGenerator:
             raise ValueError(
                 f"Do not mask number and text sequence at the same time like in {x}."
             )
-        self.validate_input_molecule(text_sequence)
+        if isinstance(self.tokenizer.text_tokenizer, PolymerGraphTokenizer):
+            self.validate_input_molecule(text_sequence, MoleculeFormat.copolymer)
+        elif isinstance(self.tokenizer.text_tokenizer, SelfiesTokenizer):
+            self.validate_input_molecule(text_sequence, MoleculeFormat.selfies)
+        else:
+            self.validate_input_molecule(text_sequence, MoleculeFormat.smiles)
 
-    def validate_input_molecule(self, sequence: str) -> None:
+        self.validate_input_numerical(number_sequence)
+
+    def validate_input_molecule(
+        self, sequence: str, input_type: str = "SELFIES"
+    ) -> None:
         """
         Verifies that the non-numerical part of the input is a proper sequence.
 
@@ -199,6 +338,49 @@ class ConditionalGenerator:
             sequence: input sequence to be validated.
         """
         raise NotImplementedError
+
+    def validate_input_numerical(self, sequence: str) -> None:
+        """
+        Verifies that the numeric part of the input sequence is valid.
+
+        Args:
+            sequence: input sequence to be validated.
+        """
+        if self.tokenizer.mask_token in sequence:
+            # Task is most likely regression
+            if sequence.count(self.tokenizer.mask_token) != sum(
+                self.property_mask_lengths
+            ):
+                raise ValueError(
+                    f"To predict {self.properties} you have to mask exactly "
+                    f"{self.property_mask_lengths} times respectively."
+                )
+        else:
+            # Task is most likely generation
+            tokens = []
+            for toks in sequence.split(self.tokenizer.expression_separator):
+                tokens.extend(self.tokenizer.property_tokenizer.tokenize(toks))
+                tokens.append(self.tokenizer.expression_separator)
+            idx = list(
+                np.where(np.array(tokens) == self.tokenizer.expression_separator)[0]
+            )
+            if len(idx) < len(self.properties):
+                raise ValueError(
+                    "Please append all properties with separator token:"
+                    f"{self.tokenizer.expression_separator}."
+                )
+            if idx[0] != self.property_mask_lengths[0] + 1:
+                raise ValueError(
+                    f"To generate samples, please describe {self.properties[0]} with "
+                    f"{self.property_mask_lengths[0]} tokens."
+                )
+            if len(self.properties) > 1:
+                for i in range(len(self.properties) - 1):
+                    if idx[i + 1] - idx[i] - 2 != self.property_mask_lengths[i + 1]:
+                        raise ValueError(
+                            f"To generate samples, describe {self.properties[i + 1]}"
+                            f" with {self.property_mask_lengths[i+1]} samples."
+                        )
 
     def safely_determine_task(self, x: str) -> str:
         """
@@ -219,16 +401,12 @@ class ConditionalGenerator:
             self.tokenizer.mask_token
             in x.split(self.tokenizer.expression_separator)[-1]
         ):
-            return "generation"
 
-        if x.count(self.tokenizer.mask_token) != self.property_mask_length:
-            raise ValueError(
-                f"To predict {self.property} you have to mask {self.property_mask_length} times"
-            )
+            return "generation"
 
         return "regression"
 
-    def generate_batch_regression(self, context: Sequence) -> List[Property]:
+    def generate_batch_regression(self, context: Sequence) -> List[Sequence]:
         """
         Predict the property of a sample.
 
@@ -237,7 +415,8 @@ class ConditionalGenerator:
                 entity. E.g. <stab>[MASK][MASK][MASK][MASK]|GSQEVNSGTQTYKNASPEEAERIARKAGATTWTEKGNKWEIRI.
 
         Returns:
-            List[Property]: a list of (denormalized) predicted properties for the entity.
+            List[Sequence]: a list of (denormalized) predicted properties for the entity.
+                Stored as a Sequence (str), e.g., '<qed>0.727'.
         """
         logger.info(f"Starting prediction for sequence {context}")
 
@@ -246,7 +425,7 @@ class ConditionalGenerator:
         input_ids = inputs["input_ids"].cpu()
 
         # Forward pass
-        outputs = self.model(inputs)
+        outputs = self.model(map_tensor_dict(inputs, self.device))
 
         # Obtain the singular predictions
         prediction = self.search(outputs["logits"].detach())
@@ -255,7 +434,7 @@ class ConditionalGenerator:
 
     def compile_regression_result(
         self, input_ids: torch.Tensor, prediction: torch.Tensor
-    ) -> List[Property]:
+    ) -> List[Sequence]:
         """
         Postprocesses the prediction from the property task to obtain a float.
 
@@ -264,7 +443,9 @@ class ConditionalGenerator:
             prediction: 2D Tensor of shape (batch_size, sequence_length).
 
         Returns:
-            List[Property]: list of property values.
+            List[Sequence]: list of property sequences (one per sample). Can contain
+                multiple properties but have to be hashable, therefore we use Sequences,
+                e.g., '<qed>0.727' or '<logp>6.65<scscore>3.82'.
         """
         properties = []
         for inp, pred in zip(input_ids, prediction):
@@ -276,7 +457,14 @@ class ConditionalGenerator:
             ).split(" ")
             joined = self.tokenizer.get_sample_prediction(out_tokens, in_tokens)
             _, gen_prop = self.tokenizer.aggregate_tokens(joined, label_mode=False)
-            properties.append(self.denormalize(gen_prop[self.property[1:-1]]))
+            properties.append(
+                "".join(
+                    [
+                        f"<{k}>{self.denormalize(v, pidx)}"
+                        for pidx, (k, v) in enumerate(gen_prop.items())
+                    ]
+                )
+            )
         return properties
 
     def generate_batch_generation(self, sequence: Sequence) -> Tuple:
@@ -293,36 +481,48 @@ class ConditionalGenerator:
             Tuple[Tuple[str, float]]: a tuple of tuples, each containing the generated
                 sequence alongside its predicted property value.
         """
+        self.target = sequence
 
-        # The property score has to be in the range [0, 1]
+        # If we are in sampling mode, the sampled sequence changes per iteration.
+        if self.sampling_wrapper != {}:
+            sequence = self.sample_sequence(sequence)
+
+        # The property score has to be in the range understood by the model
         sequence = self.normalize_sequence(sequence)
 
-        logger.warning(f"Starting prediction for sequence {sequence}")
+        logger.info(f"Starting prediction for sequence {sequence}")
 
         # Prepare the batch
         tokens = self.tokenizer(sequence)
         inputs = self.collator([tokens] * self.batch_size)
         input_ids = inputs["input_ids"].clone()
+
         # Forward pass
-        outputs = self.model(inputs)
+        outputs = self.model(map_tensor_dict(inputs, self.device))
         # Obtain model predictions via the search method
-        predictions = self.search(outputs["logits"].detach()).squeeze()
+        predictions = self.search(outputs["logits"].detach()).squeeze().cpu()
         # Combine predictions with the static part to obtain the full sequences
-        generations = input_ids
+        generations = input_ids.cpu()
         generations[generations == self.tokenizer.mask_token_id] = predictions[
             generations == self.tokenizer.mask_token_id
         ]
 
         # Second part: Predict the properties of the just generated sequence
-        _input = self.property_collator.mask_tokens(generations)
+        try:
+            _input = self.property_collator.mask_tokens(generations)
+        except UnboundLocalError:
+            # NOTE: in case there are errors with the collator we can't have successes
+            return ()
+
         prediction_input = {
             "input_ids": _input[0],
             "perm_mask": _input[1],
             "target_mapping": _input[2],
             "attention_mask": self.property_collator.attention_mask(generations),
         }
+
         # Pass through model
-        property_outputs = self.model(prediction_input)
+        property_outputs = self.model(map_tensor_dict(prediction_input, self.device))
         # It's a design choice to go with greedy predictions here
         predictions = torch.argmax(property_outputs["logits"].detach(), dim=-1)
         # Obtain floating predictions
@@ -336,47 +536,87 @@ class ConditionalGenerator:
             )
             for seq in generations
         ]
-        successes: Tuple = tuple(
+
+        # Filter out all sequences that do not satisfy property constraints within
+        # tolerance range.
+        logger.debug(f"Sequences {sequences}, properties: {properties}")
+        property_successes: Tuple = tuple(
             filter(
-                lambda x: abs(self.normalize(x[1]) - self.target_value)
-                < self.tolerance,
+                lambda x: all(
+                    [
+                        abs(
+                            float(x[1].split(p)[-1].split("<")[0])
+                            - self.target_values[i]
+                        )
+                        < self.tolerances[i]
+                        for i, p in enumerate(self.properties)
+                    ]
+                ),
                 zip(sequences, properties),
             )
         )  # type: ignore
+
+        # filter out sequences that do not include desired substructures
+        successes = self.filter_substructures(property_successes)  # type: ignore
         logger.info(f"Successes: {successes}")
         return successes
 
     def normalize_sequence(self, context: Sequence) -> Sequence:
         """
-        Take a sequence with a unnormalized property score and convert it to a
+        Take a sequence with unnormalized property score(s) and convert it to a
         sequence with a normalized score.
 
         Args:
             context: sequence with unnormalized property.
 
         Returns:
-            Sequence: sequence with normalized property.
+            sequence with normalized property.
         """
+
+        # Tokenize sequence and extract positions of separator tokens
         tokens = self.tokenizer.tokenize(context)
-        numerical_tokens = tokens[
-            tokens.index(self.property)
-            + 1 : tokens.index(self.tokenizer.expression_separator)
+        final_tokens = ""
+        sep_idxs = [
+            i for i, t in enumerate(tokens) if t == self.tokenizer.expression_separator
         ]
 
-        unnorm = self.tokenizer.floating_tokens_to_float(numerical_tokens)
         # Declard as class variable since used by other methods
-        self.target_value = self.normalize(unnorm)
-        norm = str(self.target_value)[: self.property_mask_length]
+        self.target_values = []
 
-        tokens = (
-            "".join(tokens[: tokens.index(self.property) + 1])
-            + norm
-            + "".join(tokens[tokens.index(self.tokenizer.expression_separator) :])
-        )
-        return "".join(tokens)
+        # Loop over properties and normalize them
+        for idx, prop in enumerate(self.properties):
+            numerical_tokens = tokens[tokens.index(prop) + 1 : sep_idxs[idx]]
+            final_tokens += prop
+
+            unnorm = self.tokenizer.floating_tokens_to_float(numerical_tokens)
+            self.target_values.append(unnorm)
+            target = self.normalize(unnorm, idx)
+            norm = str(target + 1e-10)[: self.property_mask_lengths[idx]]
+            final_tokens += norm + self.tokenizer.expression_separator
+
+        # Append rest of sequence
+        final_tokens += "".join(tokens[sep_idxs[-1] + 1 :])
+        return final_tokens
 
     @staticmethod
-    def validate_numerical(sequences: List[Any]):
+    def isfloat(sequence: str) -> bool:
+        """Safely determine whether a string can be converted to a float
+
+        Args:
+            sequence: A string
+
+        Returns:
+            Whether it can be converted to a float
+        """
+        try:
+            float(sequence)
+            return True
+        except ValueError:
+            return False
+
+    def validate_numerical(
+        self, sequences: List[Any]
+    ) -> Tuple[List[Sequence], List[int]]:
         """
         Validate whether a list of sequences contains only numerical values.
 
@@ -384,20 +624,261 @@ class ConditionalGenerator:
             sequences: a list of hopefully only numerical values.
 
         Returns:
-             List[Any]: a tuple containing of the validated floats and valid indexes.
+            A tuple of two lists for the validated Sequences and their respective
+            indices.
+        """
+        items = []
+        idxs = []
+        for idx, item in enumerate(sequences):
+            if (
+                isinstance(item, str)
+                and item.startswith("<")
+                and self.isfloat(item.split(">")[-1])
+            ):
+                items.append(item)
+                idxs.append(idx)
+        return items, idxs
+
+    def validate_sampling_wrapper(
+        self,
+        context: str,
+        property_goal: Dict[str, Any] = {},
+        fraction_to_mask: float = 0.2,
+        tokens_to_mask: List = [],
+        substructures_to_mask: List[str] = [],
+        substructures_to_keep: List[str] = [],
+        text_filtering: bool = False,
+    ) -> None:
+        """
+        Validating whether the wrapper can be used for conditional generation of samples.
+
+        Args:
+            context: A string that is used as a seed. Has to be a SMILES or a block-copoylmer
+                (RegressionTransformerMolecules) or AAS (RegressionTransformerProteins).
+            property_goal: Specifies the property conditions for the targeted generation.
+               The keys are the properties and have to be aligned with the
+               algorithm_version. For example, for the solubility model use:
+               {'<esol>': 1.23}
+               or for the logp_and_synthesizability model use:
+               {'<logp>': 1.23, '<synthesizability>': 2.34}
+                Defaults to {}, but it has to be specified.
+            fraction_to_mask: The fraction of tokens that can be changed. Defaults to 0.2.
+            tokens_to_mask: A list of atoms (or amino acids) that can be considered for masking.
+                Defaults to [] meaning that all tokens can be masked. E.g., use ['F'] to
+                only mask fluorine atoms.
+            substructures_to_mask: Specifies a list of substructures that should be masked.
+                Given in SMILES format. This is excluded from the stochastic masking.
+                NOTE: The model operates on SELFIES and the matching of the substructures occurs
+                in SELFIES simply on a string level.
+            substructures_to_keep: Specifies a list of substructures that should definitely be kept.
+                Given in SMILES format. This is excluded from the stochastic masking.
+                NOTE: This keeps tokens even if they are included in `tokens_to_mask`.
+                NOTE: The model operates on SELFIES and the matching of the substructures occurs
+                in SELFIES simply on a string level.
+            text_filtering: Generated sequences are post-hoc filtered for the presence of
+                `substructures_to_keep`. This is done with RDKit substructure matches. If the sub-
+                structure cant be converted to a mol object, this argument toggles whether a substructure
+                should be ignored from post-hoc filtering (this happens per default) or whether
+                filtering should occur on a pure string level.
+                NOTE: This does not affect the actual generation process.
+                Defaults to False.
+        """
+        if isinstance(self.tokenizer.text_tokenizer, PolymerGraphTokenizer):
+            self.validate_input_molecule(context, MoleculeFormat.copolymer)
+        else:
+            self.validate_input_molecule(context, MoleculeFormat.smiles)
+
+        self.seed_molecule = context
+
+        if property_goal == {}:
+            raise ValueError("Please specify the target properties with a dictionary.")
+        if not all([k in property_goal.keys() for k in self.properties]):
+            raise ValueError(
+                f"Please provide property goals for all properties: {self.properties}."
+            )
+        self.property_goal = property_goal
+
+        if not isinstance(fraction_to_mask, float):
+            raise TypeError(
+                f"The fraction_to_mask {fraction_to_mask} has to be a float."
+            )
+        if fraction_to_mask < 0 or fraction_to_mask > 1:
+            raise ValueError(
+                f"The fraction_to_mask {fraction_to_mask} has to be between 0 and 1."
+            )
+        self.fraction_to_mask = fraction_to_mask
+
+        if not isinstance(tokens_to_mask, list):
+            raise TypeError(f"The tokens_to_mask {tokens_to_mask} has to be a list.")
+        self.maskable_tokens = self.get_maskable_tokens(tokens_to_mask.copy())
+
+        found_maskable = list(filter(lambda x: x in context, tokens_to_mask))
+        if len(found_maskable) == 0 and tokens_to_mask != []:
+            raise ValueError(
+                "Malformed search query: None of the `tokens_to_mask` "
+                f"{tokens_to_mask} are in the `context`: {context}."
+            )
+        elif len(found_maskable) < len(tokens_to_mask):
+            logger.warning(
+                "Malformed search query: Some of the `tokens_to_mask` "
+                f"{tokens_to_mask} are not in the `context`: {context}."
+            )
+
+        if not isinstance(text_filtering, bool):
+            raise TypeError(f"The text_filtering {text_filtering} has to be a bool.")
+        self.text_filtering = text_filtering
+
+        self.validate_substructures(substructures_to_mask, substructures_to_keep)
+
+        logger.info(
+            f"Will start sampling molecules similar to {context} with goal: "
+            f"{property_goal} and masking {fraction_to_mask} of the tokens."
+        )
+
+    def sample_sequence(self, seq: str) -> str:
+        """
+        Assembling a RT-sequence from a seed SMILES/AAS sequence.
+
+        Args:
+            seq: A SMILES/AAS string used as seed.
+
+        Returns:
+            A RT-sequence that uses SELFIES/AAS and incorporates the properties, e.g.:
+            `<logp>1.234|<synthesizability>1.234|[C][C][O]`
         """
 
-        items = [item if isinstance(item, float) else None for item in sequences]
-        idxs = [i for i, item in enumerate(sequences) if isinstance(item, float)]
-        return items, idxs
+        if self.sampling_wrapper == {}:
+            return seq
+
+        # Convert SMILES/AAS to list of SELFIES/AAS tokens
+        language_seq = self.language_encoding(seq)
+        tokens = self.tokenizer.text_tokenizer.tokenize(language_seq)
+
+        # Determine which tokens can be masked (from `tokens_to_mask`)
+        maskable_tokens = (
+            set(tokens) if self.maskable_tokens == [] else set(self.maskable_tokens)
+        )
+        maskable_idxs = [i for i, t in enumerate(tokens) if t in maskable_tokens]
+
+        # Make sure that `substructures_to_keep` are not masked
+        for keep in self.substructures_to_keep:
+            keep_toks = self.tokenizer.text_tokenizer.tokenize(
+                self.language_encoding(keep)
+            )
+            to_be_kept = get_substructure_indices(tokens, keep_toks)
+            maskable_idxs = list(filter(lambda x: x not in to_be_kept, maskable_idxs))
+
+        num_to_mask = round(len(maskable_idxs) * self.fraction_to_mask)
+        # Mask the tokens
+        mask_idxs = np.random.choice(maskable_idxs, num_to_mask, replace=False)
+        sequence_tokens = [
+            t if i not in mask_idxs else self.tokenizer.mask_token
+            for i, t in enumerate(tokens)
+        ]
+
+        # Make sure that `substructures_to_mask` are actually masked
+        for mask in self.substructures_to_mask:
+            mask_toks = self.tokenizer.text_tokenizer.tokenize(
+                self.language_encoding(mask)
+            )
+            to_be_masked = get_substructure_indices(tokens, mask_toks)
+            for idx in to_be_masked:
+                sequence_tokens[idx] = self.tokenizer.mask_token
+
+        # Extract the property tokens
+        if not set(self.properties) == set(self.property_goal.keys()):
+            raise ValueError(
+                f"Please provide property goals exactly for: {self.properties}."
+            )
+
+        # Define property tokens (this has unnormalized property values)
+        prop_tokens = ""
+        for i, p in enumerate(self.properties):
+            numerical = str(self.property_goal[p] + 1e-10)[
+                : self.property_mask_lengths[i]
+            ]
+            prop_tokens += p + numerical + self.tokenizer.expression_separator
+
+        # Return new sequence
+        sequence = prop_tokens + "".join(sequence_tokens)
+        return sequence
+
+    def get_maskable_tokens(self, tokens_to_mask: List[str]):
+        raise NotImplementedError
+
+    def language_encoding(self, seq: str):
+        raise NotImplementedError
+
+    def filter_substructures(self, property_successes: Tuple[Tuple[str, str]]):
+        raise NotImplementedError
+
+    def validate_substructures(
+        self, substructures_to_mask: List[str], substructures_to_keep: List[str]
+    ):
+        """
+        Validates the substructures that are ignored/kept for the masking when the
+        `sampling_wrapper` is used.
+
+
+        Args:
+            substructures_to_mask: List of substructures that should be masked.
+            substructures_to_keep: List of substructures that should be kept.
+
+        Raises:
+            NotImplementedError: Implemented by the child classes.
+        """
+        seed_encoded = self.language_encoding(self.seed_molecule)
+        if not isinstance(substructures_to_mask, list):
+            raise TypeError(
+                f"The substructures_to_mask {substructures_to_mask} has to be a list."
+            )
+        to_mask = []
+        for mask in substructures_to_mask:
+            if not isinstance(mask, str):
+                raise TypeError(
+                    f"The substructure_to_mask {mask} has to be a string in {self.subs_format} format."
+                )
+            if self.language_encoding(mask) not in seed_encoded:
+                logger.error(
+                    f"\nSubstructure to keep in {mask} not found in seed sequence, ignoring it."
+                )
+            else:
+                to_mask.append(mask)
+        self.substructures_to_mask = to_mask
+
+        if not isinstance(substructures_to_keep, list):
+            raise TypeError(
+                f"The substructures_to_keep {substructures_to_keep} has to be a list."
+            )
+        to_keep = []
+        for keep in substructures_to_keep:
+            if not isinstance(keep, str):
+                raise TypeError(
+                    f"The substructure_to_keep {keep} has to be a string in AAS format."
+                )
+            if self.language_encoding(keep) not in seed_encoded:
+                logger.error(
+                    f"\nSubstructure to keep in {keep} not found in seed sequence, ignoring it."
+                )
+            else:
+                to_keep.append(keep)
+
+        self.substructures_to_keep = to_keep
+        # Contains even the ones whose strings cant be found in seed string
+        self.all_substructures_to_keep = substructures_to_keep
+
+        if len(set(self.substructures_to_keep + self.substructures_to_mask)) < len(
+            self.substructures_to_keep
+        ) + len(self.substructures_to_mask):
+            raise ValueError(
+                "Substructures to mask and keep contain duplicates or overlap."
+            )
 
 
 class ChemicalLanguageRT(ConditionalGenerator):
     """
     Hybrid regression and conditional molecular generation model as implemented in
-    https://arxiv.org/abs/2202.01338. It generates molecules with a desired solubility
-    (ESOL) score or predicts the ESOL of a given molecule.
-    For details on the ESOL task see: https://pubs.acs.org/doi/10.1021/ci034243x
+    https://arxiv.org/abs/2202.01338.
 
     Attributes:
         resources_path: path to the model.
@@ -408,6 +889,8 @@ class ChemicalLanguageRT(ConditionalGenerator):
         tolerance: the tolerance for the property of the generated molecules.
     """
 
+    subs_format: str = "SMILES"
+
     def __init__(
         self,
         resources_path: str,
@@ -415,7 +898,8 @@ class ChemicalLanguageRT(ConditionalGenerator):
         search: str = "sample",
         temperature: float = 1.4,
         batch_size: int = 8,
-        tolerance: float = 20.0,
+        tolerance: Union[float, Dict[str, float]] = 20.0,
+        sampling_wrapper: Dict[str, Any] = {},
         device: Optional[Union[torch.device, str]] = None,
     ) -> None:
         """
@@ -423,18 +907,34 @@ class ChemicalLanguageRT(ConditionalGenerator):
 
         Args:
             resources_path: directory where to find models and parameters.
+            context: user-specified input text for the model.
             search: search key to instantiate a search, defaults to `sample`.
             temperature: temperature for the sampling. Defaults to 1.4.
             batch_size: number of points sampled per call. Defaults to 8.
             tolerance: the tolerance for the property of the generated molecules.
                 Given in percent. Defaults to 20.
+            sampling_wrapper: A high-level entry point that allows specifying a seed
+                SMILES alongside some target conditions.
+                NOTE: If this is used, the `target` needs to be a single SMILES string.
+                Example: {
+                    'fraction_to_mask': 0.5,
+                    'tokens_to_mask': [],
+                    'property_goal': {'<qed>': 0.85}
+                }
             device: device where the inference s running either as a dedicated class
                 or a string. If not provided is inferred.
         """
-        super().__init__(device=device, resources_path=resources_path)
+        super().__init__(
+            device=device, resources_path=resources_path, tolerance=tolerance
+        )
 
-        # Validate input and determine task
-        self.task = self.safely_determine_task(context)
+        if sampling_wrapper == {}:
+            # Validate input and determine task
+            self.task = self.safely_determine_task(context)
+        else:
+            self.validate_sampling_wrapper(context=context, **sampling_wrapper)
+            self.task = "generation"
+        self.sampling_wrapper = sampling_wrapper
 
         # Console outputs for usage of search methods
         if search == "sample" and self.task == "regression":
@@ -454,26 +954,42 @@ class ChemicalLanguageRT(ConditionalGenerator):
             self.batch_size = batch_size
             self.property_collator = PropertyCollator(
                 tokenizer=self.tokenizer,
-                property_tokens=[self.property],
-                num_tokens_to_mask=[-1],
-                ignore_errors=False,
+                property_tokens=self.properties,
+                num_tokens_to_mask=[-1] * len(self.properties),
+                ignore_errors=True,
             )
-            # Tolerance on [0,1] scale
-            self.tolerance = tolerance / 100.0
+
         else:
             raise ValueError(f"Unknown task: {self.task}")
 
-    def validate_input_molecule(self, sequence: str) -> None:
+        self.small_mol = True
+
+    def validate_input_molecule(
+        self, sequence: str, input_type: str = MoleculeFormat.selfies
+    ) -> None:
         """
-        Verifies that the non-numerical part of the input sequence is a SELFIES.
+        Verifies that the non-numerical part of the input sequence is a molecule.
 
         Args:
             sequence: input sequence to be validated.
+            input_type: whether the input is validated to be a SELFIES (default), SMILES or COPOLYMER.
         """
-        # Fractional molecules based on non-masked parts of the SELFIES sequence
-        smis = list(map(decoder, sequence.split(self.tokenizer.mask_token)))
-        if -1 in smis:
-            raise ValueError(f"Invalid sequence: {sequence}")
+
+        if input_type == MoleculeFormat.selfies:
+            # Fractional molecules based on non-masked parts of the SELFIES sequence
+            smis = list(map(decoder, sequence.split(self.tokenizer.mask_token)))
+            _, idxs = validate_molecules(smis, input_type)  # type: ignore
+        elif (
+            input_type == MoleculeFormat.smiles
+            or input_type == MoleculeFormat.copolymer
+        ):
+            _, idxs = validate_molecules([sequence], input_type)
+            if len(idxs) != 1:
+                raise ValueError(
+                    f"The context {sequence} is not a valid {input_type} string."
+                )
+        else:
+            raise ValueError(f"Unknown data type {input_type}.")
 
     def validate_output(self, sequences: List[Any]) -> Tuple[List[Any], List[int]]:
         """
@@ -483,20 +999,138 @@ class ChemicalLanguageRT(ConditionalGenerator):
             sequences: list of sequences to be validated.
 
         Returns:
-            A tuple of validated items (Chem.rdchem.Mol in the case of a generation task
-                floating values otherwise) and a list of valid indexes.
+            A tuple of validated items:
+                - the validate items, a list of either:
+                    - Chem.rdchem.Mol (generation task)
+                    - Sequence denoting the predicted properties (regression task)
+                - list of valid indexes.
         """
 
         if self.task == "regression":
             return self.validate_numerical(sequences)
         else:
             # Convert SELFIES to SMILES
+            if isinstance(self.tokenizer.text_tokenizer, PolymerGraphTokenizer):
+                # Copolymer models require specific validation
+                return validate_molecules(
+                    pattern_list=list(zip(*sequences))[0],  # type: ignore
+                    input_type=MoleculeFormat.copolymer,
+                )
+
             smiles_list = list(
-                filter(lambda x: x is not None, list(zip(*sequences))[0])
+                filter(
+                    lambda x: x != self.target and x is not None,
+                    list(zip(*sequences))[0],
+                )
             )
             if smiles_list == []:
                 return ([None], [-1])
-            return validate_molecules(smiles_list=smiles_list)  # type: ignore
+            return validate_molecules(pattern_list=smiles_list, input_type=MoleculeFormat.smiles)  # type: ignore
+
+    def get_maskable_tokens(self, tokens_to_mask: List[str]) -> List[str]:
+        """
+        Convert a user-defined list of maskable tokens into a RT model-friendly format.
+
+        Args:
+            tokens_to_mask: List of atoms specified in SMILES notation.
+
+        Returns:
+            List of atoms in SELFIES notation.
+        """
+        # To reflect double bonds
+        tokens_to_mask.extend([f"={t}" for t in tokens_to_mask])
+        return [encoder(a) for a in tokens_to_mask]  # type: ignore
+
+    def language_encoding(self, seq: str) -> str:
+        if isinstance(self.tokenizer.text_tokenizer, SelfiesTokenizer):
+            selfie = encoder(seq)
+            if not isinstance(selfie, str):
+                raise TypeError(
+                    f"{seq} (type={type(seq)}) is not a SMILES sequence that can be converted to SELFIES."
+                )
+            return selfie
+        else:
+            return seq
+
+    def filter_substructures(
+        self, property_successes: Tuple[Tuple[str, str]]
+    ) -> Tuple[Tuple[str, str]]:
+        """
+        Remove samples where user-required substructures are absent from generated samples.
+
+        Args:
+            property_successes: A tuple of samples that passed the property constraints.
+                This is a tuple of tuples, where the first element is the SMILES and the
+                second is the property prediction string.
+
+        Returns:
+            A tuple of samples that passed the property constraints and the substructure constraints.
+            Same format as input
+        """
+        if isinstance(self.tokenizer.text_tokenizer, PolymerGraphTokenizer):
+            return property_successes
+        if self.sampling_wrapper == {}:
+            return property_successes
+
+        # Remove samples with stub-like sequences (spuriously small)
+        property_successes = filter_stubbed(
+            property_successes, target=self.target, threshold=0.5
+        )
+
+        successes: List[Tuple[str, str]] = []
+        subs_mols: List = []
+        for keep in self.all_substructures_to_keep:
+            subs_mol = Chem.MolFromSmiles(keep) or Chem.MolFromSmarts(keep)
+            if subs_mol is None:
+                logger.warning(
+                    f"{keep} is not a valid SMILES/SELFIES. Instead substructure filtering "
+                    f"based on sequence alone can be done and is set to: {self.text_filtering}"
+                )
+            if keep not in self.substructures_to_keep and not Chem.MolFromSmiles(  # type: ignore
+                self.target
+            ).HasSubstructMatch(
+                subs_mol
+            ):
+                logger.info(
+                    f"{keep} could not be identified in SMILES/SELFIES on text level AND no "
+                    "substructure match occurred, hence it will be ignored"
+                )
+                subs_mols.append(None)
+            elif keep not in self.substructures_to_keep:
+                logger.info(
+                    f"{keep} could not be identified in SMILES/SELFIES on *string*-level but since the"
+                    "RDKit match was successful, it will still be used for post-hoc filtering."
+                )
+                subs_mols.append(subs_mol)
+            else:
+                # "Normal" substructure
+                subs_mols.append(subs_mol)
+
+        # Perform filtering
+        for smi, prop in property_successes:
+            if smi is None:
+                continue
+            sane = True
+            mol = Chem.MolFromSmiles(smi)
+            for subs_mol, subs_string in zip(subs_mols, self.all_substructures_to_keep):
+                if subs_mol is None:
+                    if (
+                        self.text_filtering
+                        and subs_string not in smi
+                        and subs_string in self.substructures_to_keep
+                    ):
+                        sane = False
+                        break
+                else:
+                    if not mol.HasSubstructMatch(subs_mol):  # type: ignore
+                        # Desired substructure not found
+                        sane = False
+                        break
+            if sane:
+                successes.append((smi, prop))
+
+        result = cast(Tuple[Tuple[str, str]], tuple(successes))
+        return result
 
 
 class ProteinLanguageRT(ConditionalGenerator):
@@ -515,6 +1149,8 @@ class ProteinLanguageRT(ConditionalGenerator):
         tolerance: the tolerance for the property of the generated molecules.
     """
 
+    subs_format: str = "AAS"
+
     def __init__(
         self,
         resources_path: str,
@@ -522,7 +1158,8 @@ class ProteinLanguageRT(ConditionalGenerator):
         search: str = "sample",
         temperature: float = 1.4,
         batch_size: int = 32,
-        tolerance: float = 20.0,
+        tolerance: Union[float, Dict[str, float]] = 20.0,
+        sampling_wrapper: Dict[str, Any] = {},
         device: Optional[Union[torch.device, str]] = None,
     ) -> None:
         """
@@ -534,14 +1171,29 @@ class ProteinLanguageRT(ConditionalGenerator):
             temperature: temperature for the sampling. Defaults to 1.4.
             batch_size: number of points sampled per call. Defaults to 8.
             tolerance: the tolerance for the property of the generated molecules.
-                Given in percent. Defaults to 20.
+                Given in percent. Defaults to 20.0.
+            sampling_wrapper: A high-level entry point that allows specifying a seed
+                SMILES alongside some target conditions.
+                NOTE: If this is used, the `target` needs to be a single SMILES string.
+                Example: {
+                    'fraction_to_mask': 0.5,
+                    'tokens_to_mask': [],
+                    'property_goal': {'<stab>': 0.85}
+                }
             device: device where the inference s running either as a dedicated class
                 or a string. If not provided is inferred.
         """
-        super().__init__(device=device, resources_path=resources_path)
+        super().__init__(
+            device=device, resources_path=resources_path, tolerance=tolerance
+        )
 
-        # Validate input and determine task
-        self.task = self.safely_determine_task(context)
+        if sampling_wrapper == {}:
+            # Validate input and determine task
+            self.task = self.safely_determine_task(context)
+        else:
+            self.task = "generation"
+            self.validate_sampling_wrapper(context=context, **sampling_wrapper)
+        self.sampling_wrapper = sampling_wrapper
 
         # Console outputs for usage of search methods
         if search == "sample" and self.task == "regression":
@@ -560,28 +1212,29 @@ class ProteinLanguageRT(ConditionalGenerator):
             self.batch_size = batch_size
             self.property_collator = PropertyCollator(
                 tokenizer=self.tokenizer,
-                property_tokens=[self.property],
-                num_tokens_to_mask=[-1],
+                property_tokens=self.properties,
+                num_tokens_to_mask=[-1] * len(self.properties),
                 ignore_errors=False,
             )
-            # Tolerance on [0,1] scale
-            self.tolerance = tolerance / 100.0
         else:
             raise ValueError(f"Unknown task: {self.task}")
 
-    def validate_input_molecule(self, sequence: str) -> None:
+        self.small_mol = False
+
+    def validate_input_molecule(self, sequence: str, input_type: str = "") -> None:
         """
         Verifies that the non-numerical part of the input sequence is a valid AAS.
 
         Args:
             sequence: input sequence to be validated.
+            input_type: str argument that is ignored but needed for sibling class.
         """
         if sequence != sequence.upper():
             raise ValueError(
                 f"Sequence {sequence} does not follow IUPAC convention for AAS"
             )
 
-    def validate_output(self, sequences: Any) -> Tuple[List[Any], List[int]]:
+    def validate_output(self, sequences: List[Any]) -> Tuple[List[Any], List[int]]:
         """
         Validate the output of the RT model.
 
@@ -589,7 +1242,11 @@ class ProteinLanguageRT(ConditionalGenerator):
             sequences: list of sequences to be validated.
 
         Returns:
-            A tuple of validated items and a list of valid indexes.
+            A tuple of validated items:
+                - List of validated items, either:
+                    - Amino acid sequences (generation task)
+                    - Sequence denoting the predicted properties (regression task)
+                - a list of valid indexes.
         """
 
         if self.task == "regression":
@@ -602,11 +1259,59 @@ class ProteinLanguageRT(ConditionalGenerator):
                         item[0] == item[0].upper()
                         and self.tokenizer.mask_token not in item[0]
                         and not any([s.isdigit() for s in item[0]])
+                        and item[0] != self.target
                     )
-                    and isinstance(item[1], float)
+                    and self.validate_numerical(item[1])
                 )
                 else None
                 for item in sequences
             ]
             idxs = [i for i, item in enumerate(sequences) if item in items]
             return items, idxs
+
+    def get_maskable_tokens(self, tokens_to_mask: List[str]) -> List[str]:
+        """
+        Convert a user-defined list of maskable tokens (amino acids) into a RT
+            model-friendly format. Nothing has to be done for proteins, but the function
+            is more complex for sister-classes.
+
+        Args:
+            tokens_to_mask: List of amino acids specified in IUPAC convention.
+
+        Returns:
+            The same.
+        """
+        return tokens_to_mask
+
+    def language_encoding(self, seq: str) -> str:
+        return seq
+
+    def filter_substructures(
+        self, property_successes: Tuple[Tuple[str, str]]
+    ) -> Tuple[Tuple[str, str]]:
+        """
+        Remove samples where user-required substructures are absent from generated samples.
+
+        Args:
+            property_successes: A tuple of samples that passed the property constraints.
+                This is a tuple of tuples, where the first element is the sequence and the second the
+                property prediction string.
+
+        Returns:
+            A tuple of samples that passed the property constraints and the substructure constraints.
+            Same format as input
+        """
+        if self.sampling_wrapper == {}:
+            return property_successes
+
+        successes = []
+        for seq, prop in property_successes:
+            sane = True
+            for keep in self.substructures_to_keep:
+                if keep not in seq:
+                    sane = False
+                    break
+            if sane:
+                successes.append((seq, prop))
+
+        return tuple(successes)  # type: ignore

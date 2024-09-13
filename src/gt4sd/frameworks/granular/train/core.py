@@ -28,6 +28,8 @@ from argparse import Namespace
 from typing import Any, Dict
 
 import sentencepiece as _sentencepiece
+import torch as _torch
+import tensorflow as _tensorflow
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -38,8 +40,10 @@ from ..dataloader.dataset import build_dataset_and_architecture
 from ..ml.models import AUTOENCODER_ARCHITECTURES
 from ..ml.module import GranularModule
 
-# sentencepiece has to be loaded before lightning to avoid segfaults
+# imports that have to be loaded before lightning to avoid segfaults
 _sentencepiece
+_tensorflow
+_torch
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -91,7 +95,7 @@ def train_granular(configuration: Dict[str, Any]) -> None:
         "logs", name=getattr(arguments, "basename", "default")
     )
     checkpoint_callback = ModelCheckpoint(
-        every_n_val_epochs=getattr(arguments, "checkpoint_every_n_val_epochs", 5),
+        every_n_epochs=getattr(arguments, "checkpoint_every_n_val_epochs", 5),
         save_top_k=-1,
     )
     trainer = pl.Trainer.from_argparse_args(
@@ -102,9 +106,6 @@ def train_granular(configuration: Dict[str, Any]) -> None:
         log_every_n_steps=getattr(arguments, "trainer_log_every_n_steps", 50),
         callbacks=[checkpoint_callback],
         max_epochs=getattr(arguments, "epoch", 1),
-        flush_logs_every_n_steps=getattr(
-            arguments, "trainer_flush_logs_every_n_steps", 100
-        ),
     )
     trainer.fit(module, dm)
 

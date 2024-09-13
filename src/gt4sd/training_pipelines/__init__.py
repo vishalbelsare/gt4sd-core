@@ -22,14 +22,46 @@
 # SOFTWARE.
 #
 """Module initialization for gt4sd traning pipelines."""
-
 import json
 import logging
 from typing import Any, Dict
 
-import pkg_resources
+import sentencepiece as _sentencepiece
+import torch as _torch
+import tensorflow as _tensorflow
+from gt4sd_trainer.hf_pl.core import (
+    LanguageModelingDataArguments,
+    LanguageModelingModelArguments,
+    LanguageModelingSavingArguments,
+    LanguageModelingTrainingPipeline,
+)
+from gt4sd_trainer.hf_pl.pytorch_lightning_trainer import (
+    PytorchLightningTrainingArguments,
+)
 
 from ..cli.load_arguments_from_dataclass import extract_fields_from_class
+from ..tests.utils import exitclose_file_creator
+from .cgcnn.core import (
+    CGCNNDataArguments,
+    CGCNNModelArguments,
+    CGCNNSavingArguments,
+    CGCNNTrainingArguments,
+    CGCNNTrainingPipeline,
+)
+from .crystals_crf.core import (
+    CrystalsRFCDataArguments,
+    CrystalsRFCModelArguments,
+    CrystalsRFCSavingArguments,
+    CrystalsRFCTrainingArguments,
+    CrystalsRFCTrainingPipeline,
+)
+from .diffusion.core import (
+    DiffusionDataArguments,
+    DiffusionForVisionTrainingPipeline,
+    DiffusionModelArguments,
+    DiffusionSavingArguments,
+    DiffusionTrainingArguments,
+)
 from .guacamol_baselines.core import GuacaMolDataArguments, GuacaMolSavingArguments
 from .guacamol_baselines.smiles_lstm.core import (
     GuacaMolLSTMModelArguments,
@@ -53,18 +85,35 @@ from .paccmann.core import (
     PaccMannTrainingArguments,
 )
 from .paccmann.vae.core import PaccMannVAEModelArguments, PaccMannVAETrainingPipeline
-from .pytorch_lightning.core import PytorchLightningTrainingArguments
+from .pytorch_lightning.gflownet.core import (
+    GFlowNetDataArguments,
+    GFlowNetModelArguments,
+    GFlowNetPytorchLightningTrainingArguments,
+    GFlowNetSavingArguments,
+    GFlowNetTrainingPipeline,
+)
 from .pytorch_lightning.granular.core import (
     GranularDataArguments,
     GranularModelArguments,
+    GranularPytorchLightningTrainingArguments,
     GranularSavingArguments,
     GranularTrainingPipeline,
 )
-from .pytorch_lightning.language_modeling.core import (
-    LanguageModelingDataArguments,
-    LanguageModelingModelArguments,
-    LanguageModelingSavingArguments,
-    LanguageModelingTrainingPipeline,
+from .pytorch_lightning.molformer.core import (
+    MolformerDataArguments,
+    MolformerModelArguments,
+    MolformerSavingArguments,
+    MolformerTrainingArguments,
+    MolformerTrainingPipeline,
+)
+from .regression_transformer.core import (
+    RegressionTransformerDataArguments,
+    RegressionTransformerSavingArguments,
+    RegressionTransformerTrainingArguments,
+)
+from .regression_transformer.implementation import (
+    RegressionTransformerModelArguments,
+    RegressionTransformerTrainingPipeline,
 )
 from .torchdrug.core import (
     TorchDrugDataArguments,
@@ -79,6 +128,11 @@ from .torchdrug.graphaf.core import (
     TorchDrugGraphAFModelArguments,
     TorchDrugGraphAFTrainingPipeline,
 )
+
+# imports that have to be loaded before lightning to avoid segfaults
+_sentencepiece
+_tensorflow
+_torch
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -110,7 +164,7 @@ TRAINING_PIPELINE_ARGUMENTS_MAPPING = {
         TorchDrugGraphAFModelArguments,
     ),
     "granular-trainer": (
-        PytorchLightningTrainingArguments,
+        GranularPytorchLightningTrainingArguments,
         GranularDataArguments,
         GranularModelArguments,
     ),
@@ -129,6 +183,36 @@ TRAINING_PIPELINE_ARGUMENTS_MAPPING = {
         MosesOrganModelArguments,
         MosesDataArguments,
     ),
+    "regression-transformer-trainer": (
+        RegressionTransformerTrainingArguments,
+        RegressionTransformerDataArguments,
+        RegressionTransformerModelArguments,
+    ),
+    "diffusion-trainer": (
+        DiffusionTrainingArguments,
+        DiffusionDataArguments,
+        DiffusionModelArguments,
+    ),
+    "gflownet-trainer": (
+        GFlowNetPytorchLightningTrainingArguments,
+        GFlowNetDataArguments,
+        GFlowNetModelArguments,
+    ),
+    "cgcnn": (
+        CGCNNDataArguments,
+        CGCNNModelArguments,
+        CGCNNTrainingArguments,
+    ),
+    "crystals-rfc": (
+        CrystalsRFCDataArguments,
+        CrystalsRFCModelArguments,
+        CrystalsRFCTrainingArguments,
+    ),
+    "molformer": (
+        MolformerDataArguments,
+        MolformerModelArguments,
+        MolformerTrainingArguments,
+    ),
 }
 
 TRAINING_PIPELINE_MAPPING = {
@@ -140,6 +224,12 @@ TRAINING_PIPELINE_MAPPING = {
     "guacamol-lstm-trainer": GuacaMolLSTMTrainingPipeline,
     "moses-organ-trainer": MosesOrganTrainingPipeline,
     "moses-vae-trainer": MosesVAETrainingPipeline,
+    "regression-transformer-trainer": RegressionTransformerTrainingPipeline,
+    "diffusion-trainer": DiffusionForVisionTrainingPipeline,
+    "gflownet-trainer": GFlowNetTrainingPipeline,
+    "cgcnn": CGCNNTrainingPipeline,
+    "crystals-rfc": CrystalsRFCTrainingPipeline,
+    "molformer": MolformerTrainingPipeline,
 }
 
 TRAINING_PIPELINE_ARGUMENTS_FOR_MODEL_SAVING = {
@@ -151,6 +241,12 @@ TRAINING_PIPELINE_ARGUMENTS_FOR_MODEL_SAVING = {
     "guacamol-lstm-trainer": GuacaMolSavingArguments,
     "moses-organ-trainer": MosesSavingArguments,
     "moses-vae-trainer": MosesSavingArguments,
+    "regression-transformer-trainer": RegressionTransformerSavingArguments,
+    "diffusion-trainer": DiffusionSavingArguments,
+    "gflownet-trainer": GFlowNetSavingArguments,
+    "cgcnn": CGCNNSavingArguments,
+    "crystals-rfc": CrystalsRFCSavingArguments,
+    "molformer": MolformerSavingArguments,
 }
 
 
@@ -163,16 +259,14 @@ def training_pipeline_name_to_metadata(name: str) -> Dict[str, Any]:
     Returns:
         dictionary describing the parameters of the pipeline. If the pipeline is not found, no metadata (a.k.a., an empty dictionary is returned).
     """
+
     metadata: Dict[str, Any] = {"training_pipeline": name, "parameters": {}}
     if name in TRAINING_PIPELINE_NAME_METADATA_MAPPING:
         try:
-            with open(
-                pkg_resources.resource_filename(
-                    "gt4sd",
-                    f"training_pipelines/{TRAINING_PIPELINE_NAME_METADATA_MAPPING[name]}",
-                ),
-                "rt",
-            ) as fp:
+            path = exitclose_file_creator(
+                f"training_pipelines/{TRAINING_PIPELINE_NAME_METADATA_MAPPING[name]}"
+            )
+            with open(path, "rt") as fp:
                 metadata["parameters"] = json.load(fp)
         except Exception:
             logger.exception(

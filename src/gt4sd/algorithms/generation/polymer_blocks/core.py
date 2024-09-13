@@ -28,7 +28,7 @@ import os
 from dataclasses import field
 from typing import ClassVar, Dict, Optional, TypeVar
 
-from ....domains.materials import SmallMolecule, validate_molecules
+from ....domains.materials import SMILES, MoleculeFormat, validate_molecules
 from ....exceptions import InvalidItem
 from ....training_pipelines.core import TrainingPipelineArguments
 from ....training_pipelines.paccmann.core import PaccMannSavingArguments
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 T = type(None)
-S = TypeVar("S", bound=SmallMolecule)
+S = TypeVar("S", bound=SMILES)
 
 
 class PolymerBlocks(GeneratorAlgorithm[S, T]):
@@ -102,7 +102,7 @@ class PolymerBlocks(GeneratorAlgorithm[S, T]):
 
 
 @ApplicationsRegistry.register_algorithm_application(PolymerBlocks)
-class PolymerBlocksGenerator(AlgorithmConfiguration[SmallMolecule, None]):
+class PolymerBlocksGenerator(AlgorithmConfiguration[SMILES, None]):
     """Configuration to generate subunits of polymers."""
 
     algorithm_type: ClassVar[str] = "generation"
@@ -135,17 +135,17 @@ class PolymerBlocksGenerator(AlgorithmConfiguration[SmallMolecule, None]):
             batch_size=self.batch_size,
         )
 
-    def validate_item(self, item: str) -> SmallMolecule:
+    def validate_item(self, item: str) -> SMILES:
         (
             molecules,
             _,
-        ) = validate_molecules([item])
+        ) = validate_molecules([item], MoleculeFormat.smiles)
         if molecules[0] is None:
             raise InvalidItem(
                 title="InvalidSMILES",
                 detail=f'rdkit.Chem.MolFromSmiles returned None for "{item}"',
             )
-        return SmallMolecule(item)
+        return SMILES(item)
 
     @classmethod
     def get_filepath_mappings_for_training_pipeline_arguments(

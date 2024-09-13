@@ -23,33 +23,34 @@
 #
 """Types, classes, validation, etc. for the material domain."""
 
-from typing import List, NewType, Tuple, Union
+from enum import Enum
+from typing import Any, List, NewType, Tuple, Union
 
 import numpy as np
 import pandas as pd
 from rdkit import Chem
+from rdkit.Chem import Mol
 
-from gt4sd.exceptions import InvalidItem
-
-# TODO setting to str directly requires no wrapping, so wrong strings could be passed
+# TODO: setting to str directly requires no wrapping, so wrong strings could be passed
 Protein = str  # NewType('Protein', str)
 SMILES = str  # NewType('SMILES', str)
-SmallMolecule = SMILES
+SELFIES = str  # NewType('SELFIES', str)
+Copolymer = str  # NewType('Copolymer', str)
+SmallMolecule = Union[SMILES, Mol]
+MacroMolecule = Union[Protein, Mol]
 Omics = Union[np.ndarray, pd.Series]
 PAG = SMILES
-Molecule = Union[SmallMolecule, Protein]
+Molecule = Union[SmallMolecule, MacroMolecule]
 Sequence = str
-Property = float
 
 
-def check_smiles(smiles: SMILES):
-    try:
-        pass  # TODO
-    except Exception:
-        raise InvalidItem(title="invalid SMILES", detail="Validation as SMILES failed.")
+class MoleculeFormat(str, Enum):
+    selfies = "SELFIES"
+    smiles = "SMILES"
+    copolymer = "Copolymer"
 
 
-def validate_molecules(
+def validate_smiles(
     smiles_list: List[SMILES],
 ) -> Tuple[List[Chem.rdchem.Mol], List[int]]:
     """Validate molecules.
@@ -70,14 +71,73 @@ def validate_molecules(
         for index, molecule in enumerate(molecules)
         if molecule is not None and molecule != ""
     ]
-    return molecules, valid_ids
+    return molecules, valid_ids  # type: ignore
+
+
+def validate_selfies(
+    selfies_list: List[SELFIES],
+) -> Tuple[List[SELFIES], List[int]]:
+    """Validate molecules.
+
+    Args:
+        selfies_list: list of SELFIES representing molecules.
+
+    Returns:
+        a tuple containing RDKit molecules and valid indexes.
+    """
+    # selfies is not valid if it contains -1 so return no valid ids
+    valid_ids = [i for i, s in enumerate(selfies_list) if s != -1]
+    selfies = [s for i, s in enumerate(selfies_list) if i in valid_ids]
+    return selfies, valid_ids
+
+
+def validate_copolymer(
+    copolymers_list: List[Copolymer],
+) -> Tuple[List[Copolymer], List[int]]:
+    """Validate copolymers.
+
+    Args:
+        copolymers_list: list of Copolymer representing molecules.
+
+    Returns:
+        a tuple containing RDKit molecules and valid indexes.
+    """
+    # TODO implement actual validation
+
+    # Remove duplicates
+    copolymers, idxs = [], []
+    for i, copolymer in enumerate(copolymers_list):
+        if copolymer not in copolymers:
+            copolymers.append(copolymer)
+            idxs.append(i)
+    return copolymers, idxs
+
+
+MOLECULE_FORMAT_VALIDATOR_FACTORY = {
+    MoleculeFormat.selfies: validate_selfies,
+    MoleculeFormat.smiles: validate_smiles,
+    MoleculeFormat.copolymer: validate_copolymer,
+}
+
+
+def validate_molecules(
+    pattern_list: List[str],
+    input_type: str,
+) -> Tuple[List[Any], List[int]]:
+    """Validate molecules.
+
+    Args:
+        pattern_list: list of patterns representing molecules.
+        input_type: type of patter (SELFIES, SMILES OR Copolymer).
+
+    Returns:
+        a tuple containing RDKit molecules and valid indexes.
+    """
+    return MOLECULE_FORMAT_VALIDATOR_FACTORY[input_type](pattern_list)  # type: ignore
 
 
 Bounds = Tuple[int, int]  # NewType('Bounds', Tuple[int, int])
 
 PhotoacidityCondition = NewType("PhotoacidityCondition", Bounds)
-# photoacidity_condition = PhotoacidityCondition(
-#     (0, 1)
-# )  # PhotoacidityCondition(Bounds((0, 1))) if Bound was a new type
 
 ConditionPAG = Union[PhotoacidityCondition]

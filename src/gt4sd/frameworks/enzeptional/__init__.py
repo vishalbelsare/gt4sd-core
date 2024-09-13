@@ -1,7 +1,7 @@
 #
 # MIT License
 #
-# Copyright (c) 2022 GT4SD team
+# Copyright (c) 2024 GT4SD team
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -25,5 +25,17 @@
 
 Module for enzyme optimization.
 """
-
-from .optimization import EnzymeOptimizer  # noqa: F401
+from enzeptional import (  # noqa: F401
+    EnzymeOptimizer,
+    SequenceMutator,
+    SequenceScorer,
+    CrossoverGenerator,
+    HuggingFaceEmbedder,
+    HuggingFaceModelLoader,
+    HuggingFaceTokenizerLoader,
+    SelectionGenerator,
+    mutate_sequence_with_variant,
+    round_up,
+    sanitize_intervals,
+    sanitize_intervals_with_padding,
+)

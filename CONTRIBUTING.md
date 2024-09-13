@@ -18,7 +18,7 @@ When you contribute to the GT4SD project with a new pull request,
 a bot will evaluate whether you have signed the CLA. If required, the
 bot will comment on the pull request, including a link to accept the
 agreement. The [individual CLA](./iCLA.md) document is available for review in this repo.
-You can sign the agreement right away by opening an issue clicking [here](https://github.com/GT4SD/gt4sd-core/issues/new?assignees=C-nit%2C+christofid%2C+drugilsberg%2C+jannisborn%2C+kwehden&labels=cla-signing&template=cla-signature.md&title=CLA+signature).
+You can sign the agreement right away by opening an issue clicking [here](https://github.com/GT4SD/gt4sd-core/issues/new?assignees=&labels=cla-signing&template=cla-signature.yaml&title=CLA+signature).
 
 ## Contributing to GT4SD codebase
 
@@ -48,7 +48,7 @@ If you would like to contribute to the package, we recommend the following devel
 5. Create and activate a dedicated conda environment:
 
     ```sh
-    conda env create -f conda.yml
+    conda env create -f conda_cpu_mac.yml # for linux use conda_cpu_linux.yml
     conda activate gt4sd
     ```
 
@@ -61,6 +61,7 @@ If you would like to contribute to the package, we recommend the following devel
 7. Implement your changes and once you are ready run the tests:
 
     ```sh
+    # this can take quite long a it's downloading all models and running them multiple times in the tests
     python -m pytest -sv
     ```
 
@@ -69,7 +70,6 @@ If you would like to contribute to the package, we recommend the following devel
     ```sh
     # blacking and sorting imports (this might change your files)
     python -m black src/gt4sd
-    python -m isort src/gt4sd
     # checking flake8 and mypy
     python -m flake8 --disable-noqa --per-file-ignores="__init__.py:F401" src/gt4sd
     python -m mypy src/gt4sd
@@ -78,7 +78,7 @@ If you would like to contribute to the package, we recommend the following devel
     Ensure the license headers:
 
     ```sh
-    licenseheaders -y 2022 -d src/gt4sd -o "GT4SD team" -t mit.tmpl
+    licenseheaders -y 2023 -d src/gt4sd -o "GT4SD team" -t mit.tmpl
     ```
 
 8. Once the tests and checks passes, but most importantly you are happy with the implemented feature, commit your changes.

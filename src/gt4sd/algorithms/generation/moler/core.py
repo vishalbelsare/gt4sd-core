@@ -30,7 +30,7 @@ import logging
 from dataclasses import field
 from typing import Any, ClassVar, Dict, Optional, TypeVar
 
-from ....domains.materials import SmallMolecule, validate_molecules
+from ....domains.materials import SMILES, MoleculeFormat, validate_molecules
 from ....exceptions import InvalidItem
 from ...core import AlgorithmConfiguration, GeneratorAlgorithm, Untargeted
 from ...registry import ApplicationsRegistry
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 T = type(None)
-S = TypeVar("S", bound=SmallMolecule)
+S = TypeVar("S", bound=SMILES)
 
 
 class MoLeR(GeneratorAlgorithm[S, T]):
@@ -105,7 +105,7 @@ class MoLeR(GeneratorAlgorithm[S, T]):
 
 
 @ApplicationsRegistry.register_algorithm_application(MoLeR)
-class MoLeRDefaultGenerator(AlgorithmConfiguration[SmallMolecule, Any]):
+class MoLeRDefaultGenerator(AlgorithmConfiguration[SMILES, Any]):
     """Configuration to generate compounds using default parameters of MoLeR."""
 
     algorithm_type: ClassVar[str] = "generation"
@@ -134,6 +134,18 @@ class MoLeRDefaultGenerator(AlgorithmConfiguration[SmallMolecule, Any]):
         default=6,
         metadata=dict(description="Number of workers used for generation."),
     )
+    seed_smiles: str = field(
+        default="",
+        metadata=dict(
+            description="Dot-separated SMILES used to initialize the encoder. If empty, random codes are used."
+        ),
+    )
+    sigma: float = field(
+        default=0.0,
+        metadata=dict(
+            description="Variance of Gaussian noise being added to latent code."
+        ),
+    )
 
     def get_target_description(self) -> Optional[Dict[str, str]]:
         """Get description of the target for generation.
@@ -159,9 +171,11 @@ class MoLeRDefaultGenerator(AlgorithmConfiguration[SmallMolecule, Any]):
             beam_size=self.beam_size,
             seed=self.seed,
             num_workers=self.num_workers,
+            seed_smiles=self.seed_smiles,
+            sigma=self.sigma,
         )
 
-    def validate_item(self, item: str) -> SmallMolecule:
+    def validate_item(self, item: str) -> SMILES:
         """Check that item is a valid SMILES.
 
         Args:
@@ -176,10 +190,10 @@ class MoLeRDefaultGenerator(AlgorithmConfiguration[SmallMolecule, Any]):
         (
             molecules,
             _,
-        ) = validate_molecules([item])
+        ) = validate_molecules([item], MoleculeFormat.smiles)
         if molecules[0] is None:
             raise InvalidItem(
                 title="InvalidSMILES",
                 detail=f'rdkit.Chem.MolFromSmiles returned None for "{item}"',
             )
-        return SmallMolecule(item)
+        return SMILES(item)

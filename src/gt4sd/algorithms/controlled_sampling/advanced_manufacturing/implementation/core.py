@@ -154,7 +154,7 @@ class Objective:
         targets: Dict[str, float],
         property_predictors: Dict[str, PropertyPredictor],
         representations: RepresentationsDict,
-        representation_order: List[str] = None,
+        representation_order: Optional[List[str]] = None,
         scalers: Optional[Dict[str, Scaler]] = None,
         weights: Optional[Dict[str, float]] = None,
         custom_score_function: Optional[
@@ -328,8 +328,11 @@ class GaussianProcessRepresentationsSampler:
         self.dimensions = self.define_dimensions(self.representation_order)
 
     def _get_bounds(
-        self, minimum_value: float, maximum_value: float, z_dimension: int
-    ) -> List[Tuple[float, float]]:
+        self,
+        minimum_value: Union[float, np.float32],
+        maximum_value: Union[float, np.float32],
+        z_dimension: int,
+    ) -> List[Tuple[Union[float, np.float32], Union[float, np.float32]]]:
         """
         Define a list of bounds for an hypercube.
 
@@ -365,7 +368,7 @@ class GaussianProcessRepresentationsSampler:
                 self.bounds[representation_name] = bounds  # type:ignore
         for representation_name in self.representations.keys() - self.bounds.keys():
             z_dimension = self.representations[representation_name].z_dimension
-            self.bounds[representation_name] = self._get_bounds(
+            self.bounds[representation_name] = self._get_bounds(  # type: ignore
                 MINIMUM_REAL, MAXIMUM_REAL, z_dimension
             )
 
@@ -387,9 +390,9 @@ class GaussianProcessRepresentationsSampler:
                 latent_index, latent_index + representation.z_dimension
             )
             latent_index += representation.z_dimension
-            dimensions.extend(
-                [
-                    Real(lower_bound, upper_bound)  # type:ignore
+            dimensions.extend(  # type: ignore
+                [  # type: ignore
+                    Real(lower_bound, upper_bound)  # type: ignore
                     for lower_bound, upper_bound in representation_bounds
                 ]
             )

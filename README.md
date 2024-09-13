@@ -6,56 +6,64 @@
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![Contributions](https://img.shields.io/badge/contributions-welcome-blue)](https://github.com/GT4SD/gt4sd-core/blob/main/CONTRIBUTING.md)
 [![Docs](https://img.shields.io/badge/website-live-brightgreen)](https://gt4sd.github.io/gt4sd-core/)
-[![Total downloads](https://pepy.tech/badge/gt4sd)](https://pepy.tech/project/gt4sd)
-[![Monthly downloads](https://pepy.tech/badge/gt4sd/month)](https://pepy.tech/project/gt4sd)
+[![Total downloads](https://static.pepy.tech/badge/gt4sd)](https://pepy.tech/project/gt4sd)
+[![Monthly downloads](https://static.pepy.tech/badge/gt4sd/month)](https://pepy.tech/project/gt4sd)
 [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/GT4SD/gt4sd-core/main)
+[![DOI](https://zenodo.org/badge/458309249.svg)](https://zenodo.org/badge/latestdoi/458309249)
+[![2022 IEEE Open Software Services Award](https://img.shields.io/badge/Award-2022%20IEEE%20Open%20Software%20Services%20Award-yellow)](https://conferences.computer.org/services/2022/awards/oss_award.html)
+[![Paper DOI: 10.1038/s41524-023-01028-1](https://zenodo.org/badge/DOI/10.1038/s41524-023-01028-1.svg)](https://www.nature.com/articles/s41524-023-01028-1)
 
-<img src="./docs/_static/gt4sd_logo.png" alt="logo" width="500"/>
+<img src="./docs/_static/gt4sd_graphical_abstract.png" alt="logo" width="800">
 
-The GT4SD (Generative Toolkit for Scientific Discovery) is an open-source platform to accelerate hypothesis generation in the scientific discovery process. It provides a library for making state-of-the-art generative AI models easier to use.
+
+The **GT4SD** (Generative Toolkit for Scientific Discovery) is an open-source platform to accelerate hypothesis generation in the scientific discovery process. It provides a library for making state-of-the-art generative AI models easier to use.
 
 For full details on the library API and examples see the [docs](https://gt4sd.github.io/gt4sd-core/).
+Almost all pretrained models are also available via `gradio`-powered [web apps](https://huggingface.co/GT4SD) on Hugging Face Spaces.
 
 ## Installation
 
-### requirements
+### Requirements
 
 Currently `gt4sd` relies on:
 
-- python>=3.7,<3.8
-- pip>=19.1,<20.3
+- python>=3.7,<=3.10
+- pip==24.0
 
-We are actively working on relaxing these, so stay tuned or help us with this by [contributing](./CONTRIBUTING.md) to the project.
+If you need others, help us by [contributing](./CONTRIBUTING.md) to the project.
 
-### conda
+### Conda
 
-The recommended way to install the `gt4sd` is to create a dedicated conda environment, this will ensure all requirements are satisfied:
+The recommended way to install the `gt4sd` is to create a dedicated conda environment, this will ensure all requirements are satisfied. For CPU:
 
 ```sh
-conda env create -f conda.yml
+git clone https://github.com/GT4SD/gt4sd-core.git
+cd gt4sd-core/
+conda env create -f conda_cpu_mac.yml # for linux use conda_cpu_linux.yml
 conda activate gt4sd
-```
-
-And install the package via `pip` from [PyPI](https://pypi.org/project/gt4sd/):
-
-```sh
 pip install gt4sd
 ```
 
-**NOTE:** In case you want to reuse an existing compatible environment (see [requirements](#requirements)), you can use `pip`, but as of now (:eyes: on [issue](https://github.com/GT4SD/gt4sd-core/issues/31) for changes), some dependencies require installation from GitHub, so for a complete setup install them with:
+**NOTE 1:** By default `gt4sd` is installed with CPU requirements. For GPU usage replace with:
+
+```sh
+conda env create -f conda_gpu.yml
+```
+
+**NOTE 2:** In case you want to reuse an existing compatible environment (see [requirements](#requirements)), you can use `pip`, but as of now (:eyes: on [issue](https://github.com/GT4SD/gt4sd-core/issues/31) for changes), some dependencies require installation from GitHub, so for a complete setup install them with:
 
 ```sh
 pip install -r vcs_requirements.txt
 ```
 
+A few VCS dependencies require Git LFS (make sure it's available on your system).
+
 ### Development setup & installation
 
-If you would like to contribute to the package, we recommend the following development setup:
+If you would like to contribute to the package, we recommend to install gt4sd in
+editable mode inside your `conda` environment:
 
 ```sh
-conda env create -f conda.yml
-conda activate gt4sd
-# install gt4sd in editable mode
 pip install --no-deps -e .
 ```
 
@@ -64,6 +72,9 @@ Learn more in [CONTRIBUTING.md](./CONTRIBUTING.md)
 ## Getting started
 
 After install you can use `gt4sd` right away in your discovery workflows.
+
+<img src="./docs/_static/gt4sd_case_study.jpg" alt="logo" width="800"/>
+
 
 ### Running inference pipelines in your python code
 
@@ -104,6 +115,8 @@ print(items)
 
 GT4SD can run inference pipelines based on the `gt4sd-inference` CLI command.
 It allows to run all inference algorithms directly from the command line.
+To see which algorithms are available and how to use the CLI for your favorite model,
+check out [examples/cli/README.md](./examples/cli/README.md).
 
 You can run inference pipelines simply typing:
 
@@ -206,6 +219,8 @@ The trainer currently supports the following training pipelines:
 - `moses-vae-trainer`: Moses VAE models.
 - `torchdrug-gcpn-trainer`: TorchDrug Graph Convolutional Policy Network model.
 - `torchdrug-graphaf-trainer`: TorchDrug autoregressive GraphAF model.
+- `diffusion-trainer`: Diffusers model.
+- `gflownet-trainer`: GFlowNet model.
 
 ```console
 $ gt4sd-trainer --help
@@ -248,7 +263,7 @@ gt4sd-trainer --training_pipeline_name ${TRAINING_PIPELINE_NAME} --help
 
 Once a training pipeline has been run via the `gt4sd-trainer`, it's possible to save the trained algorithm via `gt4sd-saving` for usage in compatible inference pipelines.
 
-Here a small example for `PaccmannGP` algorithm ([paper](https://doi.org/10.1021/acs.jcim.1c00889)).
+Here a small example for `PaccMannGP` algorithm ([paper](https://doi.org/10.1021/acs.jcim.1c00889)).
 
 You can train a model with `gt4sd-trainer` (quick training using few data, not really recommended for a realistic model :warning:):
 
@@ -266,6 +281,48 @@ Run the algorithm via `gt4sd-inference` (again the model produced in the example
 
 ```sh
 gt4sd-inference --algorithm_name PaccMannGP --algorithm_application PaccMannGPGenerator --algorithm_version fast-example-v0 --number_of_samples 5  --target '{"molwt": {"target": 60.0}}'
+```
+
+### Uploading a trained algorithm on a public hub via the CLI command
+
+You can upload trained and finetuned models easily in the public hub using `gt4sd-upload`. The syntax follows the saving pipeline:
+
+```sh
+gt4sd-upload --training_pipeline_name paccmann-vae-trainer --model_path /tmp/gt4sd-paccmann-gp --training_name fast-example --target_version fast-example-v0 --algorithm_application PaccMannGPGenerator
+```
+
+**NOTE:** GT4SD can be configured to upload models to a custom or self-hosted COS.
+An example on self-hosting locally a COS (minio) where to upload your models can be found [here](https://gt4sd.github.io/gt4sd-core/source/gt4sd_server_upload_md.html).
+
+
+### Computing properties
+
+You can compute properties of your generated samples using the `gt4sd.properties` submodule:
+
+```python
+>>>from gt4sd.properties import PropertyPredictorRegistry
+>>>similarity_predictor = PropertyPredictorRegistry.get_property_predictor("similarity_seed", {"smiles" : "C1=CC(=CC(=C1)Br)CN"})
+>>>similarity_predictor("CCO")
+0.0333
+>>># let's inspect what other parameters we can set for similarity measuring
+>>>similarity_predictor = PropertyPredictorRegistry.get_property_predictor("similarity_seed", {"smiles" : "C1=CC(=CC(=C1)Br)CN", "fp_key": "ECFP6"})
+>>>similarity_predictor("CCO")
+>>># inspect parameters
+>>>PropertyPredictorRegistry.get_property_predictor_parameters_schema("similarity_seed")
+'{"title": "SimilaritySeedParameters", "description": "Abstract class for property computation.", "type": "object", "properties": {"smiles": {"title": "Smiles", "example": "c1ccccc1", "type": "string"}, "fp_key": {"title": "Fp Key", "default": "ECFP4", "type": "string"}}, "required": ["smiles"]}'
+>>># predict other properties
+>>>qed = PropertyPredictorRegistry.get_property_predictor("qed")
+>>>qed('CCO')
+0.4068
+>>># list properties
+>>>PropertyPredictorRegistry.list_available()
+['activity_against_target',
+ 'aliphaticity',
+ ...
+ 'scscore',
+ 'similarity_seed',
+ 'tpsa',
+ 'weight']
 ```
 
 ### Additional examples
@@ -290,6 +347,11 @@ Beyond implementing various generative modeling inference and training pipelines
 - [TAPE](https://github.com/songlab-cal/tape): encoder modules compatible with the protein language models.
 - [PaccMann](https://github.com/PaccMann/): inference pipelines for all algorithms of the PaccMann family as well as training pipelines for the generative VAEs.
 - [transformers](https://huggingface.co/transformers): training and inference pipelines for generative models from [HuggingFace Models](https://huggingface.co/models)
+- [diffusers](https://github.com/huggingface/diffusers): training and inference pipelines for generative models from [Diffusers Models](https://github.com/huggingface/diffusers)
+- [GFlowNets](https://github.com/recursionpharma/gflownet): training and inference pipeline for [Generative Flow Networks](https://yoshuabengio.org/2022/03/05/generative-flow-networks/)
+- [MolGX](https://github.com/GT4SD/molgx-core/): training and inference pipelines to generate small molecules satisfying target properties. The full implementation of MolGX, including additional functionalities, is available [here](https://github.com/GT4SD/molgx-core/).
+- [Regression Transformers](https://github.com/IBM/regression-transformer/): training and inference pipelines to generate small molecules, polymers or peptides based on numerical property constraints. For details [read the paper](https://www.nature.com/articles/s42256-023-00639-z).
+
 
 ## References
 
@@ -297,12 +359,23 @@ If you use `gt4sd` in your projects, please consider citing the following:
 
 ```bib
 @software{GT4SD,
-author = {GT4SD Team},
-month = {2},
-title = {{GT4SD (Generative Toolkit for Scientific Discovery)}},
-url = {https://github.com/GT4SD/gt4sd-core},
-version = {main},
-year = {2022}
+  author = {GT4SD Team},
+  month = {2},
+  title = {{GT4SD (Generative Toolkit for Scientific Discovery)}},
+  url = {https://github.com/GT4SD/gt4sd-core},
+  version = {main},
+  year = {2022}
+}
+
+@article{manica2022gt4sd,
+  title={Accelerating material design with the generative toolkit for scientific discovery},
+  author={Manica, Matteo and Born, Jannis and Cadow, Joris and Christofidellis, Dimitrios and Dave, Ashish and Clarke, Dean and Teukam, Yves Gaetan Nana and Giannone, Giorgio and Hoffman, Samuel C and Buchan, Matthew and others},
+  journal={npj Computational Materials},
+  volume={9},
+  number={1},
+  pages={69},
+  year={2023},
+  publisher={Nature Publishing Group UK London}
 }
 ```
 

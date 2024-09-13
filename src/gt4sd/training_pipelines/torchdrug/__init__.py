@@ -21,6 +21,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 #
+from .unpatch import (  # isort:skip
+    fix_datasets,
+    sane_datasets,
+    fix_schedulers,
+    sane_schedulers,
+    TORCH_HAS_OPENMP,
+)
+import torch
 from torchdrug.datasets import (
     BACE,
     BBBP,
@@ -57,6 +65,9 @@ invasive and causes significant side-effects in the rest of the code.
 See: https://github.com/DeepGraphLearning/torchdrug/issues/77
 """
 nn.Module = nn._Module  # type: ignore
+fix_datasets(sane_datasets)
+fix_schedulers(sane_schedulers)
+
 
 DATASET_FACTORY = {
     "bace": BACE,
@@ -83,3 +94,7 @@ DATASET_FACTORY = {
     "zinc250k": ZINC250k,
     "zinc2m": ZINC2m,
 }
+
+
+# NOTE: restore original OpenMP settings
+torch._C.has_openmp = TORCH_HAS_OPENMP

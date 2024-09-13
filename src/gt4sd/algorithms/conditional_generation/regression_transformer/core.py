@@ -27,13 +27,19 @@ RegressionTransformer is a mutlitask regression and conditional generation model
 """
 
 import logging
+import os
 from dataclasses import field
 from typing import Any, Callable, ClassVar, Dict, Iterable, Optional, TypeVar, Union
 
 from typing_extensions import Protocol, runtime_checkable
 
-from ....domains.materials import Molecule, Property, Sequence
+from ....domains.materials import Molecule, Sequence
 from ....exceptions import InvalidItem
+from ....properties.core import PropertyValue
+from ....training_pipelines.core import TrainingPipelineArguments
+from ....training_pipelines.regression_transformer.core import (
+    RegressionTransformerSavingArguments,
+)
 from ...core import AlgorithmConfiguration, GeneratorAlgorithm
 from ...registry import ApplicationsRegistry
 from .implementation import ChemicalLanguageRT, ConditionalGenerator, ProteinLanguageRT
@@ -42,7 +48,7 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 T = TypeVar("T", bound=Sequence)
-S = TypeVar("S", Property, Molecule)
+S = TypeVar("S", PropertyValue, Molecule)
 Targeted = Callable[[T], Iterable[Any]]
 
 
@@ -169,7 +175,7 @@ class RegressionTransformerMolecules(AlgorithmConfiguration[Sequence, Sequence])
         default="solubility",
         metadata=dict(
             description="The version of the algorithm to use.",
-            options=["solubility", "qed"],
+            options=["solubility", "qed", "logp_and_synthesizability"],
         ),
     )
 
@@ -191,10 +197,51 @@ class RegressionTransformerMolecules(AlgorithmConfiguration[Sequence, Sequence])
         default=8,
         metadata=dict(description="Batch size for the conditional generation"),
     )
-    tolerance: float = field(
+    tolerance: Union[float, Dict[str, float]] = field(
         default=20.0,
         metadata=dict(
-            description="Precision tolerance for the conditional generation task. Given in percent"
+            description="""Precision tolerance for the conditional generation task. This is the
+            tolerated eviation between desired/primed property and predicted property of the
+            generated molecule. Given in percentage with respect to the property range encountered
+            during training. Either a single float or a dict of floats with properties as
+            NOTE: The tolerance is *only* used for post-hoc filtering of the generated molecules.
+            """
+        ),
+    )
+    sampling_wrapper: Dict = field(
+        default_factory=dict,
+        metadata=dict(
+            description="""High-level entry point for SMILES-level access. Provide a
+            dictionary that is used to build a custom sampling wrapper.
+            NOTE: If this is used, the `target` needs to be a single SMILES string.
+            Example: {
+                'fraction_to_mask': 0.5,
+                'tokens_to_mask': [],
+                'property_goal': {'<qed>': 0.85}
+            }
+            - 'fraction_to_mask' specifies the ratio of tokens that can be changed by
+                the model.
+            - 'tokens_to_mask' specifies which atoms can be masked. This defaults
+                to an empty list, meaning that all tokens can be masked.
+            - 'property_goal' specifies the target conditions for the generation. The
+                properties need to be specified as a dictionary. The keys need to be
+                properties supported by the algorithm version.
+            - 'substructures_to_mask': Specifies a list of substructures that should be masked.
+                Given in SMILES format. This is excluded from the stochastic masking.
+                NOTE: The model operates on SELFIES and the matching of the substructures occurs
+                in SELFIES simply on a string level.
+            - 'substructures_to_keep': Specifies a list of substructures that should definitely be kept.
+                Given in SMILES format. This is excluded from the stochastic masking.
+                NOTE: This keeps tokens even if they are included in `tokens_to_mask`.
+                NOTE: The model operates on SELFIES and the matching of the substructures occurs
+                in SELFIES simply on a string level.
+            - `text_filtering`: Generated sequences are post-hoc filtered for the presence of
+                `substructures_to_keep`. This is done with RDKit substructure matches. If the sub-
+                structure cant be converted to a mol object, this argument toggles whether a substructure
+                should be ignored from post-hoc filtering (this happens per default) or whether
+                filtering should occur on a pure string level. Defaults to False.
+                NOTE: This does not affect the actual generation process.
+            """
         ),
     )
 
@@ -231,10 +278,11 @@ class RegressionTransformerMolecules(AlgorithmConfiguration[Sequence, Sequence])
             temperature=self.temperature,
             batch_size=self.batch_size,
             tolerance=self.tolerance,
+            sampling_wrapper=self.sampling_wrapper,
         )
         return self.generator
 
-    def validate_item(self, item: str) -> Union[Molecule, Property]:  # type: ignore
+    def validate_item(self, item: str) -> Union[Molecule, Sequence]:  # type: ignore
         """Check that item is a valid sequence.
 
         Args:
@@ -248,10 +296,7 @@ class RegressionTransformerMolecules(AlgorithmConfiguration[Sequence, Sequence])
         """
         if item is None:
             raise InvalidItem(title="InvalidSequence", detail="Sequence is None")
-        (
-            items,
-            _,
-        ) = self.generator.validate_output([item])
+        items, _ = self.generator.validate_output([item])
         if items[0] is None:
             if self.generator.task == "generation":
                 title = "InvalidSMILES"
@@ -261,6 +306,41 @@ class RegressionTransformerMolecules(AlgorithmConfiguration[Sequence, Sequence])
                 detail = f'"{item}" is not a valid floating point number'
             raise InvalidItem(title=title, detail=detail)
         return item
+
+    @classmethod
+    def get_filepath_mappings_for_training_pipeline_arguments(
+        cls, training_pipeline_arguments: TrainingPipelineArguments
+    ) -> Dict[str, str]:
+        """Get filepath mappings for the given training pipeline arguments.
+        Args:
+            training_pipeline_arguments: training pipeline arguments.
+        Returns:
+            a mapping between artifacts' files and training pipeline's output files.
+        """
+        if isinstance(
+            training_pipeline_arguments, RegressionTransformerSavingArguments
+        ):
+            training_path = os.path.abspath(training_pipeline_arguments.model_path)
+            if training_pipeline_arguments.checkpoint_name:
+                model_path = os.path.join(
+                    training_path, training_pipeline_arguments.checkpoint_name
+                )
+            else:
+                model_path = training_path
+
+            names = ["pytorch_model.bin", "config.json", "vocab.txt"]
+            names.extend(["special_tokens_map.json", "tokenizer_config.json"])
+
+            mapper = {name: os.path.join(model_path, name) for name in names}
+
+            # Inference file is only saved once in root training folder
+            mapper["inference.json"] = os.path.join(training_path, "inference.json")
+            return mapper
+
+        else:
+            return super().get_filepath_mappings_for_training_pipeline_arguments(
+                training_pipeline_arguments
+            )
 
 
 @ApplicationsRegistry.register_algorithm_application(RegressionTransformer)
@@ -319,10 +399,36 @@ class RegressionTransformerProteins(AlgorithmConfiguration[Sequence, Sequence]):
         default=32,
         metadata=dict(description="Batch size for the conditional generation"),
     )
-    tolerance: float = field(
+    tolerance: Union[float, Dict[str, float]] = field(
         default=20.0,
         metadata=dict(
-            description="Precision tolerance for the conditional generation task. Given in percent"
+            description="""Precision tolerance for the conditional generation task. This is the
+            tolerated eviation between desired/primed property and predicted property of the
+            generated molecule. Given in percentage with respect to the property range encountered
+            during training. Either a single float or a dict of floats with properties as
+            NOTE: The tolerance is *only* used for post-hoc filtering of the generated proteins.
+            """
+        ),
+    )
+    sampling_wrapper: Dict = field(
+        default_factory=dict,
+        metadata=dict(
+            description="""High-level entry point for SMILES-level access. Provide a
+            dictionary that is used to build a custom sampling wrapper.
+            NOTE: If this is used, the `target` needs to be a single SMILES string.
+            Example: {
+                'fraction_to_mask': 0.5,
+                'tokens_to_mask': [],
+                'property_goal': {'<qed>': 0.85}
+            }
+            - 'fraction_to_mask' specifies the ratio of tokens that can be changed by
+                the model.
+            - 'tokens_to_mask' specifies which atoms can be masked. This defaults
+                to an empty list, meaning that all tokens can be masked.
+            - 'property_goal' specifies the target conditions for the generation. The
+                properties need to be specified as a dictionary. The keys need to be
+                properties supported by the algorithm version.
+            """
         ),
     )
 
@@ -358,10 +464,11 @@ class RegressionTransformerProteins(AlgorithmConfiguration[Sequence, Sequence]):
             context=context,
             batch_size=self.batch_size,
             tolerance=self.tolerance,
+            sampling_wrapper=self.sampling_wrapper,
         )
         return self.generator
 
-    def validate_item(self, item: str) -> Union[Molecule, Property]:  # type: ignore
+    def validate_item(self, item: str) -> Union[Molecule, Sequence]:  # type: ignore
         """Check that item is a valid sequence.
 
         Args:
@@ -375,16 +482,15 @@ class RegressionTransformerProteins(AlgorithmConfiguration[Sequence, Sequence]):
         """
         if item is None:
             raise InvalidItem(title="InvalidSequence", detail="Sequence is None")
-        (
-            items,
-            _,
-        ) = self.generator.validate_output([item])
+        items, _ = self.generator.validate_output([item])
         if items[0] is None:
             if self.generator.task == "generation":
                 title = "InvalidSequence"
                 detail = f'"{item}" does not adhere to IUPAC convention for AAS'
             else:
                 title = "InvalidNumerical"
-                detail = f'"{item}" is not a valid floating point number'
+                detail = (
+                    f'"{item}" is not a valid Sequence with a floating point number'
+                )
             raise InvalidItem(title=title, detail=detail)
         return item
